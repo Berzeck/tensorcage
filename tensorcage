@@ -1,0 +1,840 @@
+#!/usr/bin/env bash
+
+APP_NAME="TensorCage"
+APP_VERSION="1.0.0"
+CLI_NAME="tensorcage"
+
+set -euo pipefail
+
+########################################
+# Tested baseline
+########################################
+
+TESTED_OPENSUSE_REL="15.6"
+OPENSUSE_REL=""
+
+########################################
+# Adjust only if needed
+########################################
+
+UPSTREAM_DNS_1="1.1.1.1"
+UPSTREAM_DNS_2="8.8.8.8"
+BTCLI_WSS_PORT="9944"
+LOCAL_PROXY_IP="127.0.0.1"
+SQUID_PORT="3128"
+UNBOUND_PORT="53"
+DNS_LOCAL_IP="127.0.0.1"
+
+# Trusted NTP IPs only; avoids pre-install DNS poisoning
+# Cloudflare NTP anycast
+NTP_IPS=(
+  "162.159.200.1"
+  "162.159.200.123"
+)
+
+PYTHON_BIN="python3"
+
+########################################
+# Domain allowlists
+########################################
+
+BASE_DNS_DOMAINS=(
+  "opensuse.org."
+  "opentensor.ai."
+  "opensuse.net.br."
+  "ufpr.br."
+  "usp.br."
+  "uepg.br."
+  "cedia.org.ec."
+)
+
+PYPI_DNS_DOMAINS=(
+  "pypi.org."
+  "pythonhosted.org."
+)
+
+########################################
+# Usage / argument parsing
+########################################
+
+usage() {
+  cat <<EOF
+${APP_NAME} ${APP_VERSION}
+
+Usage:
+  ${CLI_NAME} install
+  ${CLI_NAME} update btcli=<version> wallet=<version> btcli_hash=<sha256> wallet_hash=<sha256>
+  ${CLI_NAME} help
+  ${CLI_NAME} version
+
+Commands:
+  install   Apply baseline hardening and configure the host
+  update    Temporarily open PyPI, download exact wheels, verify SHA256, and install
+  help      Show this help message
+  version   Show version information
+
+Examples:
+  sudo ${CLI_NAME} install
+
+  sudo ${CLI_NAME} update \\
+    btcli=9.20.0 \\
+    wallet=4.0.0 \\
+    btcli_hash=<sha256> \\
+    wallet_hash=<sha256>
+EOF
+}
+
+validate_version() {
+  local v="$1"
+  [[ "$v" =~ ^[0-9]+(\.[0-9]+){1,3}([A-Za-z0-9._-]+)?$ ]]
+}
+
+validate_sha256() {
+  local h="$1"
+  [[ "$h" =~ ^[A-Fa-f0-9]{64}$ ]]
+}
+
+COMMAND="${1:-}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+BTCLI_VERSION=""
+WALLET_VERSION=""
+BTCLI_HASH=""
+WALLET_HASH=""
+
+case "${COMMAND}" in
+  install)
+    if [[ $# -ne 0 ]]; then
+      echo "install does not accept extra arguments"
+      echo
+      usage
+      exit 1
+    fi
+    ;;
+  update)
+    for arg in "$@"; do
+      case "$arg" in
+        btcli=*)
+          BTCLI_VERSION="${arg#btcli=}"
+          ;;
+        wallet=*)
+          WALLET_VERSION="${arg#wallet=}"
+          ;;
+        btcli_hash=*)
+          BTCLI_HASH="${arg#btcli_hash=}"
+          ;;
+        wallet_hash=*)
+          WALLET_HASH="${arg#wallet_hash=}"
+          ;;
+        *)
+          echo "Unknown update argument: $arg"
+          echo
+          usage
+          exit 1
+          ;;
+      esac
+    done
+
+    [[ -n "$BTCLI_VERSION" ]] || { echo "Missing required arg: btcli=<version>"; exit 1; }
+    [[ -n "$WALLET_VERSION" ]] || { echo "Missing required arg: wallet=<version>"; exit 1; }
+    [[ -n "$BTCLI_HASH" ]] || { echo "Missing required arg: btcli_hash=<sha256>"; exit 1; }
+    [[ -n "$WALLET_HASH" ]] || { echo "Missing required arg: wallet_hash=<sha256>"; exit 1; }
+
+    validate_version "$BTCLI_VERSION" || { echo "Invalid btcli version: $BTCLI_VERSION"; exit 1; }
+    validate_version "$WALLET_VERSION" || { echo "Invalid wallet version: $WALLET_VERSION"; exit 1; }
+    validate_sha256 "$BTCLI_HASH" || { echo "Invalid btcli SHA256: $BTCLI_HASH"; exit 1; }
+    validate_sha256 "$WALLET_HASH" || { echo "Invalid wallet SHA256: $WALLET_HASH"; exit 1; }
+    ;;
+  help|-h|--help|"")
+    usage
+    exit 0
+    ;;
+  version|-v|--version)
+    echo "${CLI_NAME} ${APP_VERSION}"
+    exit 0
+    ;;
+  *)
+    echo "Unknown command: ${COMMAND}"
+    echo
+    usage
+    exit 1
+    ;;
+esac
+
+########################################
+# Helpers
+########################################
+
+log() {
+  printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+backup_file() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    cp -a "$f" "${f}.bak.$(date +%F-%H%M%S)"
+  fi
+}
+
+ensure_line_in_file() {
+  local line="$1"
+  local file="$2"
+  grep -Fxq "$line" "$file" || echo "$line" >> "$file"
+}
+
+set_kv() {
+  local key="$1"
+  local value="$2"
+  local file="$3"
+
+  if grep -q "^${key}=" "$file"; then
+    sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$file"
+  else
+    echo "${key}=\"${value}\"" >> "$file"
+  fi
+}
+
+direct_rule_exists() {
+  local args=("$@")
+  firewall-cmd --permanent --direct --query-rule "${args[@]}" >/dev/null 2>&1
+}
+
+add_direct_rule_once() {
+  local args=("$@")
+  if ! direct_rule_exists "${args[@]}"; then
+    firewall-cmd --permanent --direct --add-rule "${args[@]}"
+  fi
+}
+
+repo_exists() {
+  local repo="$1"
+  zypper --no-refresh lr | tail -n +3 | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | grep -Fxq "$repo"
+}
+
+ensure_repo() {
+  local alias="$1"
+  local url="$2"
+
+  if repo_exists "$alias"; then
+    zypper mr -e "$alias" >/dev/null 2>&1 || true
+    zypper mr -u "$url" "$alias" >/dev/null 2>&1 || true
+  else
+    if ! zypper ar -f "$url" "$alias"; then
+      if repo_exists "$alias"; then
+        zypper mr -e "$alias" >/dev/null 2>&1 || true
+        zypper mr -u "$url" "$alias" >/dev/null 2>&1 || true
+      else
+        echo "Failed to add repository: $alias"
+        exit 1
+      fi
+    fi
+  fi
+}
+
+sha256_file() {
+  local f="$1"
+  sha256sum "$f" | awk '{print $1}'
+}
+
+require_command() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "Required command not found: $cmd"
+    exit 1
+  }
+}
+
+get_target_user() {
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    printf '%s\n' "$SUDO_USER"
+  else
+    printf '%s\n' "${USER}"
+  fi
+}
+
+get_target_home() {
+  local user="$1"
+  getent passwd "$user" | cut -d: -f6
+}
+
+get_visible_hostname() {
+  local host
+  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+  if [[ -n "$host" ]]; then
+    printf '%s\n' "$host"
+  else
+    printf '%s\n' "tensorcage"
+  fi
+}
+
+detect_opensuse_leap() {
+  local os_name os_version
+
+  if [[ ! -r /etc/os-release ]]; then
+    echo "Cannot detect operating system: /etc/os-release not found."
+    exit 1
+  fi
+
+  # shellcheck disable=SC1091
+  . /etc/os-release
+
+  os_name="${NAME:-}"
+  os_version="${VERSION_ID:-}"
+
+  if [[ "$os_name" != "openSUSE Leap" ]]; then
+    echo "Unsupported operating system: ${os_name:-unknown}"
+    echo "TensorCage currently supports openSUSE Leap only."
+    exit 1
+  fi
+
+  if [[ -z "$os_version" ]]; then
+    echo "Could not determine openSUSE Leap version."
+    exit 1
+  fi
+
+  OPENSUSE_REL="$os_version"
+
+  case "$OPENSUSE_REL" in
+    15.6)
+      ;;
+    16.*)
+      echo "Warning: Detected openSUSE Leap ${OPENSUSE_REL}."
+      echo "TensorCage is tested on openSUSE Leap ${TESTED_OPENSUSE_REL}."
+      echo "Continuing because Leap ${OPENSUSE_REL} is newer, but behavior is not yet validated."
+      ;;
+    *)
+      echo "Unsupported openSUSE Leap version: ${OPENSUSE_REL}"
+      echo "TensorCage currently supports Leap ${TESTED_OPENSUSE_REL} and allows Leap 16.x with warning."
+      exit 1
+      ;;
+  esac
+}
+
+print_banner() {
+  cat <<EOF
+
+██████╗ ███████╗
+██╔══██╗╚══███╔╝
+██████╔╝  ███╔╝
+██╔══██╗ ███╔╝
+██████╔╝███████╗
+╚═════╝ ╚══════╝
+
+${APP_NAME} ${APP_VERSION}
+Host-level containment for Bittensor environments
+
+Tested on: openSUSE Leap ${TESTED_OPENSUSE_REL}
+Detected host: openSUSE Leap ${OPENSUSE_REL}
+
+⚠️  Designed for use in a dedicated VM (recommended)
+⚠️  Applies strict outbound firewall and DNS restrictions
+⚠️  May break connectivity if misconfigured
+
+Recommended setup:
+  - Dedicated VM for btcli / wallet operations
+  - No general browsing or daily use
+  - Console or recovery access available
+
+EOF
+}
+
+confirm_install() {
+  read -r -p "Type 'yes' to continue: " confirm
+  if [[ "$confirm" != "yes" ]]; then
+    echo "Aborted."
+    exit 1
+  fi
+}
+
+require_baseline_install() {
+  [[ -f /etc/squid/squid.conf ]] || { echo "TensorCage is not installed: missing /etc/squid/squid.conf"; exit 1; }
+  [[ -f /etc/unbound/unbound.conf ]] || { echo "TensorCage is not installed: missing /etc/unbound/unbound.conf"; exit 1; }
+  require_command squid
+  require_command unbound-checkconf
+  require_command proxychains4
+}
+
+configure_repos() {
+  log "Ensuring repo definitions for openSUSE Leap ${OPENSUSE_REL}"
+
+  case "$OPENSUSE_REL" in
+    15.6)
+      ensure_repo repo-oss "https://download.opensuse.org/distribution/leap/${OPENSUSE_REL}/repo/oss/"
+      ensure_repo repo-non-oss "https://download.opensuse.org/distribution/leap/${OPENSUSE_REL}/repo/non-oss/"
+      ensure_repo repo-update "https://download.opensuse.org/update/leap/${OPENSUSE_REL}/oss/"
+      ensure_repo repo-update-non-oss "https://download.opensuse.org/update/leap/${OPENSUSE_REL}/non-oss/"
+      ensure_repo repo-backports-update "https://download.opensuse.org/update/leap/${OPENSUSE_REL}/backports/"
+      ensure_repo repo-sle-update "https://download.opensuse.org/update/leap/${OPENSUSE_REL}/sle/"
+      ;;
+    16.*)
+      ensure_repo repo-oss "https://download.opensuse.org/distribution/leap/${OPENSUSE_REL}/repo/oss/"
+      ensure_repo repo-non-oss "https://download.opensuse.org/distribution/leap/${OPENSUSE_REL}/repo/non-oss/"
+      ;;
+    *)
+      echo "Unsupported repository setup for openSUSE Leap ${OPENSUSE_REL}"
+      exit 1
+      ;;
+  esac
+}
+
+########################################
+# Preconditions
+########################################
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Run this script as root (preferably via sudo from your normal user)."
+  exit 1
+fi
+
+require_command firewall-cmd
+require_command getent
+require_command "$PYTHON_BIN"
+require_command zypper
+require_command systemctl
+require_command runuser
+require_command sha256sum
+require_command mktemp
+require_command find
+require_command hostname
+require_command chown
+require_command chmod
+
+detect_opensuse_leap
+
+########################################
+# Render functions
+########################################
+
+render_squid_conf() {
+  local allow_pypi="$1"
+  local visible_host
+
+  require_command squid
+  visible_host="$(get_visible_hostname)"
+
+  backup_file /etc/squid/squid.conf
+
+  cat > /etc/squid/squid.conf <<EOF
+visible_hostname ${visible_host}
+http_port ${LOCAL_PROXY_IP}:${SQUID_PORT}
+via off
+forwarded_for delete
+pinger_enable off
+
+acl allowed_domains dstdomain \\
+    .opensuse.org \\
+    .opentensor.ai \\
+    .opensuse.net.br \\
+    .ufpr.br \\
+    .usp.br \\
+    .uepg.br \\
+    .cedia.org.ec
+EOF
+
+  if [[ "$allow_pypi" == "1" ]]; then
+    cat >> /etc/squid/squid.conf <<'EOF'
+acl allowed_domains dstdomain .pypi.org .pythonhosted.org
+EOF
+  fi
+
+  cat >> /etc/squid/squid.conf <<EOF
+
+acl allowed_tls_sni ssl::server_name \\
+    .opensuse.org \\
+    .opentensor.ai \\
+    .opensuse.net.br \\
+    .ufpr.br \\
+    .usp.br \\
+    .uepg.br \\
+    .cedia.org.ec
+EOF
+
+  if [[ "$allow_pypi" == "1" ]]; then
+    cat >> /etc/squid/squid.conf <<'EOF'
+acl allowed_tls_sni ssl::server_name .pypi.org .pythonhosted.org
+EOF
+  fi
+
+  cat >> /etc/squid/squid.conf <<EOF
+
+acl SSL_ports port 443 ${BTCLI_WSS_PORT}
+http_access deny CONNECT !SSL_ports
+
+http_access allow allowed_domains
+http_access allow CONNECT allowed_tls_sni
+http_access deny all
+EOF
+
+  squid -k parse
+  systemctl reload squid 2>/dev/null || systemctl restart squid
+}
+
+render_unbound_conf() {
+  require_command unbound-checkconf
+
+  backup_file /etc/unbound/unbound.conf
+
+  cat > /etc/unbound/unbound.conf <<EOF
+server:
+  interface: ${DNS_LOCAL_IP}
+  port: ${UNBOUND_PORT}
+  access-control: 127.0.0.0/8 allow
+
+  username: "unbound"
+  directory: "/etc/unbound"
+  chroot: ""
+  pidfile: "/run/unbound/unbound.pid"
+
+  hide-identity: yes
+  hide-version: yes
+  qname-minimisation: yes
+  harden-glue: yes
+  harden-dnssec-stripped: yes
+  ratelimit: 100
+
+  use-syslog: yes
+  verbosity: 1
+
+forward-zone:
+  name: "."
+  forward-addr: ${UPSTREAM_DNS_1}
+  forward-addr: ${UPSTREAM_DNS_2}
+
+include: "/etc/unbound/allowlist/domains.conf"
+EOF
+}
+
+render_unbound_allowlist() {
+  local allow_pypi="$1"
+
+  require_command unbound-checkconf
+
+  mkdir -p /etc/unbound/allowlist
+
+  {
+    echo "server:"
+    for domain in "${BASE_DNS_DOMAINS[@]}"; do
+      echo "  local-zone: \"${domain}\" transparent"
+    done
+    if [[ "$allow_pypi" == "1" ]]; then
+      for domain in "${PYPI_DNS_DOMAINS[@]}"; do
+        echo "  local-zone: \"${domain}\" transparent"
+      done
+    fi
+    echo '  local-zone: "." refuse'
+  } > /etc/unbound/allowlist/domains.conf
+
+  unbound-checkconf /etc/unbound/unbound.conf
+  systemctl restart unbound
+}
+
+apply_policy() {
+  local allow_pypi="$1"
+
+  log "Applying policy (allow_pypi=${allow_pypi})"
+  render_squid_conf "$allow_pypi"
+  render_unbound_allowlist "$allow_pypi"
+}
+
+########################################
+# Baseline install/config mode
+########################################
+
+baseline_setup() {
+  print_banner
+  confirm_install
+
+  log "Enabling firewalld"
+  systemctl enable --now firewalld
+
+  log "Refreshing repos"
+  zypper refresh
+
+  log "Installing required packages"
+  zypper install -y squid unbound proxychains-ng bind-utils
+
+  require_command squid
+  require_command unbound-checkconf
+  require_command netconfig
+  require_command proxychains4
+
+  log "Configuring Unbound"
+  render_unbound_conf
+
+  mkdir -p /etc/systemd/system/unbound.service.d
+  cat > /etc/systemd/system/unbound.service.d/runtime.conf <<'EOF'
+[Service]
+RuntimeDirectory=unbound
+RuntimeDirectoryMode=0755
+EOF
+
+  systemctl daemon-reload
+
+  log "Configuring initial policy with PyPI closed"
+  render_unbound_allowlist 0
+  render_squid_conf 0
+
+  unbound-checkconf /etc/unbound/unbound.conf
+
+  log "Starting services"
+  systemctl enable --now squid
+  systemctl enable --now unbound
+
+  log "Configuring firewall rules"
+  local SQUID_UID
+  local UNBOUND_UID
+  local ntp_ip
+  SQUID_UID="$(id -u squid)"
+  UNBOUND_UID="$(id -u unbound)"
+
+  firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
+
+  add_direct_rule_once ipv4 filter INPUT 0 -p tcp --dport 22 -j ACCEPT
+  add_direct_rule_once ipv6 filter INPUT 0 -p tcp --dport 22 -j ACCEPT
+
+  add_direct_rule_once ipv4 filter INPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  add_direct_rule_once ipv6 filter INPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  add_direct_rule_once ipv6 filter OUTPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+  add_direct_rule_once ipv4 filter INPUT 0 -i lo -j ACCEPT
+  add_direct_rule_once ipv6 filter INPUT 0 -i lo -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -o lo -j ACCEPT
+  add_direct_rule_once ipv6 filter OUTPUT 0 -o lo -j ACCEPT
+
+  add_direct_rule_once ipv4 filter OUTPUT 0 -d "${LOCAL_PROXY_IP}" -p tcp --dport "${SQUID_PORT}" -j ACCEPT
+
+  add_direct_rule_once ipv4 filter OUTPUT 0 -d "${DNS_LOCAL_IP}" -p udp --dport "${UNBOUND_PORT}" -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -d "${DNS_LOCAL_IP}" -p tcp --dport "${UNBOUND_PORT}" -j ACCEPT
+
+  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p udp -d "${UPSTREAM_DNS_1}" --dport 53 -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p tcp -d "${UPSTREAM_DNS_1}" --dport 53 -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p udp -d "${UPSTREAM_DNS_2}" --dport 53 -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p tcp -d "${UPSTREAM_DNS_2}" --dport 53 -j ACCEPT
+
+  add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner root --sport 68 --dport 67 -j ACCEPT
+  add_direct_rule_once ipv4 filter INPUT 0 -p udp --sport 67 --dport 68 -j ACCEPT
+
+  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${SQUID_UID}" -p tcp --dport 80 -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${SQUID_UID}" -p tcp --dport 443 -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${SQUID_UID}" -p tcp --dport "${BTCLI_WSS_PORT}" -j ACCEPT
+
+  for ntp_ip in "${NTP_IPS[@]}"; do
+    add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner root -d "${ntp_ip}" --dport 123 -j ACCEPT
+    if id chrony >/dev/null 2>&1; then
+      add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner chrony -d "${ntp_ip}" --dport 123 -j ACCEPT
+    fi
+  done
+
+  add_direct_rule_once ipv4 filter OUTPUT 100 -j DROP
+  add_direct_rule_once ipv6 filter OUTPUT 100 -j DROP
+
+  firewall-cmd --set-default-zone=drop
+  firewall-cmd --reload
+
+  log "Configuring netconfig DNS"
+  local CFG=/etc/sysconfig/network/config
+  backup_file "$CFG"
+  set_kv "NETCONFIG_DNS_POLICY" "STATIC" "$CFG"
+  set_kv "NETCONFIG_DNS_STATIC_SERVERS" "${DNS_LOCAL_IP}" "$CFG"
+  netconfig update -m dns
+
+  log "Configuring zypper proxy"
+  backup_file /etc/zypp/zypp.conf
+  ensure_line_in_file "proxy=http://${LOCAL_PROXY_IP}:${SQUID_PORT}" /etc/zypp/zypp.conf
+  if grep -q '^ *download.use_deltarpm' /etc/zypp/zypp.conf; then
+    sed -i 's/^ *download\.use_deltarpm.*/download.use_deltarpm = false/' /etc/zypp/zypp.conf
+  else
+    echo 'download.use_deltarpm = false' >> /etc/zypp/zypp.conf
+  fi
+
+  configure_repos
+
+  log "Configuring proxychains"
+  backup_file /etc/proxychains.conf
+  cat > /etc/proxychains.conf <<EOF
+strict_chain
+proxy_dns
+
+[ProxyList]
+http ${LOCAL_PROXY_IP} ${SQUID_PORT}
+EOF
+
+  log "Installing btcli wrapper"
+  cat > /usr/local/bin/btc <<'EOF'
+#!/usr/bin/env bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+exec proxychains4 btcli "$@"
+EOF
+  chmod +x /usr/local/bin/btc
+
+  log "Configuring pip proxy"
+  backup_file /etc/pip.conf
+  cat > /etc/pip.conf <<EOF
+[global]
+proxy = http://${LOCAL_PROXY_IP}:${SQUID_PORT}
+EOF
+
+  log "Machine secured successfully."
+  echo
+  echo "TensorCage install completed successfully."
+  echo "Machine secured."
+}
+
+########################################
+# Update mode
+########################################
+
+update_btcli_and_wallet() {
+  local btcli_version="$1"
+  local wallet_version="$2"
+  local btcli_hash_expected="$3"
+  local wallet_hash_expected="$4"
+
+  local target_user
+  local target_home
+  local tmpdir=""
+  local btcli_file=""
+  local wallet_file=""
+  local btcli_hash_actual=""
+  local wallet_hash_actual=""
+
+  require_baseline_install
+
+  target_user="$(get_target_user)"
+  target_home="$(get_target_home "$target_user")"
+
+  cleanup() {
+    log "Re-closing PyPI access"
+    apply_policy 0 || true
+    if [[ -n "${tmpdir}" && -d "${tmpdir}" ]]; then
+      rm -rf "$tmpdir"
+    fi
+  }
+
+  trap cleanup EXIT
+
+  log "Target user for update: ${target_user}"
+
+  if ! id "$target_user" >/dev/null 2>&1; then
+    echo "Target user does not exist: $target_user"
+    exit 1
+  fi
+
+  log "Stopping common runtimes and network utilities before opening update window"
+  pkill -u "$target_user" -f "python" 2>/dev/null || true
+  pkill -u "$target_user" -f "btcli" 2>/dev/null || true
+  pkill -u "$target_user" -f "node" 2>/dev/null || true
+  pkill -u "$target_user" -f "ruby" 2>/dev/null || true
+  pkill -u "$target_user" -f "curl" 2>/dev/null || true
+  pkill -u "$target_user" -f "wget" 2>/dev/null || true
+
+  log "Temporarily opening PyPI access"
+  apply_policy 1
+
+  tmpdir="$(mktemp -d /tmp/btcli-update.XXXXXX)"
+  chown "$target_user":"$(id -gn "$target_user")" "$tmpdir"
+  chmod 0700 "$tmpdir"
+
+  log "Downloading exact wheels"
+  runuser -u "$target_user" -- env \
+    HOME="$target_home" \
+    PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    "$PYTHON_BIN" -m pip download \
+      --only-binary=:all: \
+      --no-deps \
+      --dest "$tmpdir" \
+      "bittensor-cli==${btcli_version}" \
+      "bittensor-wallet==${wallet_version}"
+
+  btcli_file="$(find "$tmpdir" -maxdepth 1 -type f -name 'bittensor_cli-*.whl' | head -n1 || true)"
+  wallet_file="$(find "$tmpdir" -maxdepth 1 -type f -name 'bittensor_wallet-*.whl' | head -n1 || true)"
+
+  [[ -n "$btcli_file" && -f "$btcli_file" ]] || {
+    echo "Failed to locate downloaded btcli wheel in $tmpdir"
+    exit 1
+  }
+
+  [[ -n "$wallet_file" && -f "$wallet_file" ]] || {
+    echo "Failed to locate downloaded wallet wheel in $tmpdir"
+    exit 1
+  }
+
+  btcli_hash_actual="$(sha256_file "$btcli_file")"
+  wallet_hash_actual="$(sha256_file "$wallet_file")"
+
+  log "Verifying btcli wheel hash"
+  [[ "$btcli_hash_actual" == "$btcli_hash_expected" ]] || {
+    echo "btcli hash mismatch"
+    echo "Expected: $btcli_hash_expected"
+    echo "Actual:   $btcli_hash_actual"
+    exit 1
+  }
+
+  log "Verifying wallet wheel hash"
+  [[ "$wallet_hash_actual" == "$wallet_hash_expected" ]] || {
+    echo "wallet hash mismatch"
+    echo "Expected: $wallet_hash_expected"
+    echo "Actual:   $wallet_hash_actual"
+    exit 1
+  }
+
+  log "Installing from verified local wheels only"
+  runuser -u "$target_user" -- env \
+    HOME="$target_home" \
+    PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    "$PYTHON_BIN" -m pip install \
+      --user \
+      --no-index \
+      --no-deps \
+      "$wallet_file" \
+      "$btcli_file"
+
+  log "Verifying installed versions"
+  runuser -u "$target_user" -- env \
+    HOME="$target_home" \
+    PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    "$PYTHON_BIN" - <<'PY'
+from importlib.metadata import version
+print("bittensor-cli:", version("bittensor-cli"))
+print("bittensor-wallet:", version("bittensor-wallet"))
+PY
+
+  if [[ -x "${target_home}/.local/bin/btcli" ]]; then
+    runuser -u "$target_user" -- env \
+      HOME="$target_home" \
+      PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+      "${target_home}/.local/bin/btcli" --version || true
+  else
+    echo "Warning: ${target_home}/.local/bin/btcli not found after install."
+  fi
+
+  trap - EXIT
+  cleanup
+  log "Strict btcli + wallet update completed"
+}
+
+########################################
+# Main
+########################################
+
+case "$COMMAND" in
+  install)
+    baseline_setup
+    ;;
+  update)
+    update_btcli_and_wallet \
+      "$BTCLI_VERSION" \
+      "$WALLET_VERSION" \
+      "$BTCLI_HASH" \
+      "$WALLET_HASH"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
