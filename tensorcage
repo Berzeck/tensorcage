@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.1.0"
+APP_VERSION="1.1.1"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -41,7 +41,7 @@ NTP_IPS=(
   "162.159.200.123"
 )
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="python3"
 
 ########################################
 # Domain allowlists
@@ -73,12 +73,14 @@ ${APP_NAME} ${APP_VERSION}
 Usage:
   ${CLI_NAME} install
   ${CLI_NAME} update btcli=<version> btcli_hash=<sha256> [wallet=<version> wallet_hash=<sha256>]
+  ${CLI_NAME} info
   ${CLI_NAME} help
   ${CLI_NAME} version
 
 Commands:
   install   Apply baseline hardening and configure the host
   update    Temporarily open PyPI, download exact wheels, verify SHA256, and install
+  info      Show security, network policy, and Squid activity summary
   help      Show this help message
   version   Show version information
 
@@ -169,6 +171,14 @@ case "${COMMAND}" in
     if [[ -n "$WALLET_VERSION" ]]; then
       validate_version "$WALLET_VERSION" || { echo "Invalid wallet version: $WALLET_VERSION"; exit 1; }
       validate_sha256 "$WALLET_HASH" || { echo "Invalid wallet SHA256: $WALLET_HASH"; exit 1; }
+    fi
+    ;;
+  info)
+    if [[ $# -ne 0 ]]; then
+      echo "info does not accept extra arguments"
+      echo
+      usage
+      exit 1
     fi
     ;;
   help|-h|--help|"")
@@ -877,6 +887,127 @@ PY
   fi
 }
 
+
+########################################
+# Info / diagnostics mode
+########################################
+
+show_info() {
+  local squid_log="/var/log/squid/access.log"
+  local target_user=""
+  local target_home=""
+
+  echo
+  echo "${APP_NAME} ${APP_VERSION} - security information"
+  echo "================================================="
+  echo
+
+  echo "[System]"
+  echo "Host: $(hostname -f 2>/dev/null || hostname)"
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    echo "OS: ${PRETTY_NAME:-unknown}"
+  else
+    echo "OS: unknown"
+  fi
+  echo "TensorCage Python: ${PYTHON_BIN}"
+  if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    "$PYTHON_BIN" --version || true
+  else
+    echo "Warning: ${PYTHON_BIN} not found"
+  fi
+  echo
+
+  echo "[Services]"
+  for svc in firewalld squid unbound; do
+    printf '%-10s enabled=%-10s active=%s\n' \
+      "$svc" \
+      "$(systemctl is-enabled "$svc" 2>/dev/null || echo unknown)" \
+      "$(systemctl is-active "$svc" 2>/dev/null || echo unknown)"
+  done
+  echo
+
+  echo "[Listening ports: DNS / Squid]"
+  ss -lntup 2>/dev/null | grep -E ":${UNBOUND_PORT}|:${SQUID_PORT}" || echo "No matching listeners found"
+  echo
+
+  echo "[Firewall direct rules]"
+  firewall-cmd --direct --get-all-rules 2>/dev/null || echo "Could not read firewalld direct rules"
+  echo
+
+  echo "[Squid log summary]"
+  if [[ ! -r "$squid_log" ]]; then
+    echo "Cannot read ${squid_log}"
+    echo "Run as root: sudo ${CLI_NAME} info"
+    return 0
+  fi
+
+  echo
+  echo "Top destinations:"
+  awk '{print $7}' "$squid_log" \
+    | cut -d/ -f3 \
+    | sort \
+    | uniq -c \
+    | sort -nr \
+    | head -n 20
+
+  echo
+  echo "Denied destinations:"
+  awk 'tolower($0) ~ /denied/ {print $7}' "$squid_log" \
+    | cut -d/ -f3 \
+    | sort \
+    | uniq -c \
+    | sort -nr \
+    | head -n 20
+
+  echo
+  echo "Denied CONNECT attempts:"
+  grep -i "DENIED" "$squid_log" 2>/dev/null \
+    | grep "CONNECT" \
+    | tail -n 20 || true
+
+  echo
+  echo "Direct-IP CONNECT attempts:"
+  grep -E 'CONNECT [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$squid_log" 2>/dev/null \
+    | tail -n 20 || true
+
+  echo
+  echo "Large transfers >100 KB:"
+  awk '$5 > 100000 {print}' "$squid_log" \
+    | tail -n 20
+
+  echo
+  echo "POST/PUT requests:"
+  grep -E " POST | PUT " "$squid_log" 2>/dev/null \
+    | tail -n 20 || true
+
+  echo
+  echo "[Installed Bittensor packages]"
+  target_user="$(get_target_user)"
+  target_home="$(get_target_home "$target_user")"
+
+  if id "$target_user" >/dev/null 2>&1 && command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    runuser -u "$target_user" -- env \
+      HOME="$target_home" \
+      PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+      "$PYTHON_BIN" - <<'TENSORCAGE_PY' 2>/dev/null || echo "Could not read Python package versions"
+from importlib.metadata import PackageNotFoundError, version
+
+for pkg in ("bittensor-cli", "bittensor-wallet"):
+    try:
+        print(f"{pkg}: {version(pkg)}")
+    except PackageNotFoundError:
+        print(f"{pkg}: not installed")
+TENSORCAGE_PY
+  else
+    echo "Could not determine target user or Python interpreter"
+  fi
+
+  echo
+  echo "Info check completed."
+}
+
 ########################################
 # Main
 ########################################
@@ -884,6 +1015,9 @@ PY
 case "$COMMAND" in
   install)
     baseline_setup
+    ;;
+  info)
+    show_info
     ;;
   update)
     update_btcli_and_wallet \
