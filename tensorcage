@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.1.1"
+APP_VERSION="1.2.0"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -41,15 +41,18 @@ NTP_IPS=(
   "162.159.200.123"
 )
 
-PYTHON_BIN="python3"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 ########################################
 # Domain allowlists
 ########################################
 
-BASE_DNS_DOMAINS=(
-  "opensuse.org."
+BT_DNS_DOMAINS=(
   "opentensor.ai."
+)
+
+OPENSUSE_DNS_DOMAINS=(
+  "opensuse.org."
   "opensuse.net.br."
   "ufpr.br."
   "usp.br."
@@ -73,6 +76,7 @@ ${APP_NAME} ${APP_VERSION}
 Usage:
   ${CLI_NAME} install
   ${CLI_NAME} update btcli=<version> btcli_hash=<sha256> [wallet=<version> wallet_hash=<sha256>]
+  ${CLI_NAME} os-update
   ${CLI_NAME} info
   ${CLI_NAME} help
   ${CLI_NAME} version
@@ -80,12 +84,15 @@ Usage:
 Commands:
   install   Apply baseline hardening and configure the host
   update    Temporarily open PyPI, download exact wheels, verify SHA256, and install
+  os-update Temporarily open openSUSE mirrors, run zypper refresh/update, and re-close
   info      Show security, network policy, and Squid activity summary
   help      Show this help message
   version   Show version information
 
 Examples:
   sudo ${CLI_NAME} install
+
+  sudo ${CLI_NAME} os-update
 
   sudo ${CLI_NAME} update \\
     btcli=9.20.0 \\
@@ -171,6 +178,14 @@ case "${COMMAND}" in
     if [[ -n "$WALLET_VERSION" ]]; then
       validate_version "$WALLET_VERSION" || { echo "Invalid wallet version: $WALLET_VERSION"; exit 1; }
       validate_sha256 "$WALLET_HASH" || { echo "Invalid wallet SHA256: $WALLET_HASH"; exit 1; }
+    fi
+    ;;
+  os-update)
+    if [[ $# -ne 0 ]]; then
+      echo "os-update does not accept extra arguments"
+      echo
+      usage
+      exit 1
     fi
     ;;
   info)
@@ -463,12 +478,17 @@ detect_opensuse_leap
 ########################################
 
 render_squid_conf() {
-  local allow_pypi="$1"
+  local allow_pypi="${1:-0}"
+  local allow_os="${2:-0}"
   local visible_host
-  local squid_domains=("${BASE_DNS_DOMAINS[@]}")
+  local squid_domains=("${BT_DNS_DOMAINS[@]}")
 
   require_command squid
   visible_host="$(get_visible_hostname)"
+
+  if [[ "$allow_os" == "1" ]]; then
+    squid_domains+=("${OPENSUSE_DNS_DOMAINS[@]}")
+  fi
 
   if [[ "$allow_pypi" == "1" ]]; then
     squid_domains+=("${PYPI_DNS_DOMAINS[@]}")
@@ -483,10 +503,10 @@ via off
 forwarded_for delete
 pinger_enable off
 
-acl allowed_domains dstdomain \\
+acl allowed_domains dstdomain \
 $(build_squid_multiline_acl squid_domains)
 
-acl allowed_tls_sni ssl::server_name \\
+acl allowed_tls_sni ssl::server_name \
 $(build_squid_multiline_acl squid_domains)
 
 acl SSL_ports port 443 ${BTCLI_WSS_PORT}
@@ -543,7 +563,8 @@ EOF
 }
 
 render_unbound_allowlist() {
-  local allow_pypi="$1"
+  local allow_pypi="${1:-0}"
+  local allow_os="${2:-0}"
 
   require_command unbound-checkconf
 
@@ -551,9 +572,14 @@ render_unbound_allowlist() {
 
   {
     echo "server:"
-    for domain in "${BASE_DNS_DOMAINS[@]}"; do
+    for domain in "${BT_DNS_DOMAINS[@]}"; do
       echo "  local-zone: \"${domain}\" transparent"
     done
+    if [[ "$allow_os" == "1" ]]; then
+      for domain in "${OPENSUSE_DNS_DOMAINS[@]}"; do
+        echo "  local-zone: \"${domain}\" transparent"
+      done
+    fi
     if [[ "$allow_pypi" == "1" ]]; then
       for domain in "${PYPI_DNS_DOMAINS[@]}"; do
         echo "  local-zone: \"${domain}\" transparent"
@@ -567,11 +593,12 @@ render_unbound_allowlist() {
 }
 
 apply_policy() {
-  local allow_pypi="$1"
+  local allow_pypi="${1:-0}"
+  local allow_os="${2:-0}"
 
-  log "Applying policy (allow_pypi=${allow_pypi})"
-  render_squid_conf "$allow_pypi"
-  render_unbound_allowlist "$allow_pypi"
+  log "Applying policy (allow_pypi=${allow_pypi}, allow_os=${allow_os})"
+  render_squid_conf "$allow_pypi" "$allow_os"
+  render_unbound_allowlist "$allow_pypi" "$allow_os"
 }
 
 ########################################
@@ -609,8 +636,8 @@ EOF
   systemctl daemon-reload
 
   log "Configuring initial policy with PyPI closed"
-  render_unbound_allowlist 0
-  render_squid_conf 0
+  render_unbound_allowlist 0 0
+  render_squid_conf 0 0
 
   unbound-checkconf /etc/unbound/unbound.conf
 
@@ -749,7 +776,7 @@ update_btcli_and_wallet() {
 
   cleanup() {
     log "Re-closing PyPI access"
-    apply_policy 0 || true
+    apply_policy 0 0 || true
     if [[ -n "${tmpdir}" && -d "${tmpdir}" ]]; then
       rm -rf "$tmpdir"
     fi
@@ -779,7 +806,7 @@ update_btcli_and_wallet() {
   pkill -u "$target_user" -f "wget" 2>/dev/null || true
 
   log "Temporarily opening PyPI access"
-  apply_policy 1
+  apply_policy 1 0
 
   tmpdir="$(mktemp -d /tmp/btcli-update.XXXXXX)"
   chown "$target_user":"$(id -gn "$target_user")" "$tmpdir"
@@ -887,6 +914,35 @@ PY
   fi
 }
 
+
+########################################
+# OS update mode
+########################################
+
+os_update() {
+  require_baseline_install
+
+  cleanup() {
+    log "Re-closing openSUSE update access"
+    apply_policy 0 0 || true
+  }
+
+  trap cleanup EXIT
+
+  log "Temporarily opening openSUSE update access"
+  apply_policy 0 1
+
+  log "Refreshing openSUSE repositories"
+  zypper refresh
+
+  log "Applying openSUSE package updates"
+  zypper update -y
+
+  trap - EXIT
+  cleanup
+
+  log "OS update completed with openSUSE access re-closed"
+}
 
 ########################################
 # Info / diagnostics mode
@@ -1015,6 +1071,9 @@ TENSORCAGE_PY
 case "$COMMAND" in
   install)
     baseline_setup
+    ;;
+  os-update)
+    os_update
     ;;
   info)
     show_info
