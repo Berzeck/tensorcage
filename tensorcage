@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.0.0"
+APP_VERSION="1.1.0"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -17,13 +17,22 @@ OPENSUSE_REL=""
 # Adjust only if needed
 ########################################
 
-UPSTREAM_DNS_1="1.1.1.1"
-UPSTREAM_DNS_2="8.8.8.8"
 BTCLI_WSS_PORT="9944"
 LOCAL_PROXY_IP="127.0.0.1"
 SQUID_PORT="3128"
 UNBOUND_PORT="53"
 DNS_LOCAL_IP="127.0.0.1"
+
+UPSTREAM_DNS_SERVERS=(
+  "1.1.1.1"
+  "8.8.8.8"
+)
+
+SQUID_EGRESS_PORTS=(
+  "80"
+  "443"
+  "${BTCLI_WSS_PORT}"
+)
 
 # Trusted NTP IPs only; avoids pre-install DNS poisoning
 # Cloudflare NTP anycast
@@ -32,7 +41,7 @@ NTP_IPS=(
   "162.159.200.123"
 )
 
-PYTHON_BIN="python3"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 ########################################
 # Domain allowlists
@@ -63,7 +72,7 @@ ${APP_NAME} ${APP_VERSION}
 
 Usage:
   ${CLI_NAME} install
-  ${CLI_NAME} update btcli=<version> wallet=<version> btcli_hash=<sha256> wallet_hash=<sha256>
+  ${CLI_NAME} update btcli=<version> btcli_hash=<sha256> [wallet=<version> wallet_hash=<sha256>]
   ${CLI_NAME} help
   ${CLI_NAME} version
 
@@ -75,6 +84,10 @@ Commands:
 
 Examples:
   sudo ${CLI_NAME} install
+
+  sudo ${CLI_NAME} update \\
+    btcli=9.20.0 \\
+    btcli_hash=<sha256>
 
   sudo ${CLI_NAME} update \\
     btcli=9.20.0 \\
@@ -138,14 +151,25 @@ case "${COMMAND}" in
     done
 
     [[ -n "$BTCLI_VERSION" ]] || { echo "Missing required arg: btcli=<version>"; exit 1; }
-    [[ -n "$WALLET_VERSION" ]] || { echo "Missing required arg: wallet=<version>"; exit 1; }
     [[ -n "$BTCLI_HASH" ]] || { echo "Missing required arg: btcli_hash=<sha256>"; exit 1; }
-    [[ -n "$WALLET_HASH" ]] || { echo "Missing required arg: wallet_hash=<sha256>"; exit 1; }
+
+    if [[ -n "$WALLET_VERSION" && -z "$WALLET_HASH" ]]; then
+      echo "wallet_hash is required if wallet version is provided"
+      exit 1
+    fi
+
+    if [[ -z "$WALLET_VERSION" && -n "$WALLET_HASH" ]]; then
+      echo "wallet version is required if wallet_hash is provided"
+      exit 1
+    fi
 
     validate_version "$BTCLI_VERSION" || { echo "Invalid btcli version: $BTCLI_VERSION"; exit 1; }
-    validate_version "$WALLET_VERSION" || { echo "Invalid wallet version: $WALLET_VERSION"; exit 1; }
     validate_sha256 "$BTCLI_HASH" || { echo "Invalid btcli SHA256: $BTCLI_HASH"; exit 1; }
-    validate_sha256 "$WALLET_HASH" || { echo "Invalid wallet SHA256: $WALLET_HASH"; exit 1; }
+
+    if [[ -n "$WALLET_VERSION" ]]; then
+      validate_version "$WALLET_VERSION" || { echo "Invalid wallet version: $WALLET_VERSION"; exit 1; }
+      validate_sha256 "$WALLET_HASH" || { echo "Invalid wallet SHA256: $WALLET_HASH"; exit 1; }
+    fi
     ;;
   help|-h|--help|"")
     usage
@@ -267,6 +291,27 @@ get_visible_hostname() {
   else
     printf '%s\n' "tensorcage"
   fi
+}
+
+dns_to_squid_domain() {
+  local domain="$1"
+  printf '.%s' "${domain%.}"
+}
+
+build_squid_multiline_acl() {
+  local -n domains_ref=$1
+  local count="${#domains_ref[@]}"
+  local i=0
+  local domain
+
+  for domain in "${domains_ref[@]}"; do
+    i=$((i + 1))
+    if [[ $i -lt $count ]]; then
+      printf '    %s \\\n' "$(dns_to_squid_domain "$domain")"
+    else
+      printf '    %s\n' "$(dns_to_squid_domain "$domain")"
+    fi
+  done
 }
 
 detect_opensuse_leap() {
@@ -410,9 +455,14 @@ detect_opensuse_leap
 render_squid_conf() {
   local allow_pypi="$1"
   local visible_host
+  local squid_domains=("${BASE_DNS_DOMAINS[@]}")
 
   require_command squid
   visible_host="$(get_visible_hostname)"
+
+  if [[ "$allow_pypi" == "1" ]]; then
+    squid_domains+=("${PYPI_DNS_DOMAINS[@]}")
+  fi
 
   backup_file /etc/squid/squid.conf
 
@@ -424,40 +474,10 @@ forwarded_for delete
 pinger_enable off
 
 acl allowed_domains dstdomain \\
-    .opensuse.org \\
-    .opentensor.ai \\
-    .opensuse.net.br \\
-    .ufpr.br \\
-    .usp.br \\
-    .uepg.br \\
-    .cedia.org.ec
-EOF
-
-  if [[ "$allow_pypi" == "1" ]]; then
-    cat >> /etc/squid/squid.conf <<'EOF'
-acl allowed_domains dstdomain .pypi.org .pythonhosted.org
-EOF
-  fi
-
-  cat >> /etc/squid/squid.conf <<EOF
+$(build_squid_multiline_acl squid_domains)
 
 acl allowed_tls_sni ssl::server_name \\
-    .opensuse.org \\
-    .opentensor.ai \\
-    .opensuse.net.br \\
-    .ufpr.br \\
-    .usp.br \\
-    .uepg.br \\
-    .cedia.org.ec
-EOF
-
-  if [[ "$allow_pypi" == "1" ]]; then
-    cat >> /etc/squid/squid.conf <<'EOF'
-acl allowed_tls_sni ssl::server_name .pypi.org .pythonhosted.org
-EOF
-  fi
-
-  cat >> /etc/squid/squid.conf <<EOF
+$(build_squid_multiline_acl squid_domains)
 
 acl SSL_ports port 443 ${BTCLI_WSS_PORT}
 http_access deny CONNECT !SSL_ports
@@ -499,8 +519,14 @@ server:
 
 forward-zone:
   name: "."
-  forward-addr: ${UPSTREAM_DNS_1}
-  forward-addr: ${UPSTREAM_DNS_2}
+EOF
+
+  local dns_ip
+  for dns_ip in "${UPSTREAM_DNS_SERVERS[@]}"; do
+    echo "  forward-addr: ${dns_ip}" >> /etc/unbound/unbound.conf
+  done
+
+  cat >> /etc/unbound/unbound.conf <<EOF
 
 include: "/etc/unbound/allowlist/domains.conf"
 EOF
@@ -586,6 +612,9 @@ EOF
   local SQUID_UID
   local UNBOUND_UID
   local ntp_ip
+  local dns_ip
+  local port
+
   SQUID_UID="$(id -u squid)"
   UNBOUND_UID="$(id -u unbound)"
 
@@ -609,17 +638,17 @@ EOF
   add_direct_rule_once ipv4 filter OUTPUT 0 -d "${DNS_LOCAL_IP}" -p udp --dport "${UNBOUND_PORT}" -j ACCEPT
   add_direct_rule_once ipv4 filter OUTPUT 0 -d "${DNS_LOCAL_IP}" -p tcp --dport "${UNBOUND_PORT}" -j ACCEPT
 
-  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p udp -d "${UPSTREAM_DNS_1}" --dport 53 -j ACCEPT
-  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p tcp -d "${UPSTREAM_DNS_1}" --dport 53 -j ACCEPT
-  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p udp -d "${UPSTREAM_DNS_2}" --dport 53 -j ACCEPT
-  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p tcp -d "${UPSTREAM_DNS_2}" --dport 53 -j ACCEPT
+  for dns_ip in "${UPSTREAM_DNS_SERVERS[@]}"; do
+    add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p udp -d "${dns_ip}" --dport 53 -j ACCEPT
+    add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p tcp -d "${dns_ip}" --dport 53 -j ACCEPT
+  done
 
   add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner root --sport 68 --dport 67 -j ACCEPT
   add_direct_rule_once ipv4 filter INPUT 0 -p udp --sport 67 --dport 68 -j ACCEPT
 
-  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${SQUID_UID}" -p tcp --dport 80 -j ACCEPT
-  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${SQUID_UID}" -p tcp --dport 443 -j ACCEPT
-  add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${SQUID_UID}" -p tcp --dport "${BTCLI_WSS_PORT}" -j ACCEPT
+  for port in "${SQUID_EGRESS_PORTS[@]}"; do
+    add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${SQUID_UID}" -p tcp --dport "${port}" -j ACCEPT
+  done
 
   for ntp_ip in "${NTP_IPS[@]}"; do
     add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner root -d "${ntp_ip}" --dport 123 -j ACCEPT
@@ -700,6 +729,8 @@ update_btcli_and_wallet() {
   local wallet_file=""
   local btcli_hash_actual=""
   local wallet_hash_actual=""
+  local -a DOWNLOAD_PACKAGES=()
+  local -a INSTALL_FILES=()
 
   require_baseline_install
 
@@ -723,6 +754,12 @@ update_btcli_and_wallet() {
     exit 1
   fi
 
+  if [[ -n "$wallet_version" ]]; then
+    log "Update mode: bittensor-cli + bittensor-wallet"
+  else
+    log "Update mode: bittensor-cli ONLY (wallet unchanged)"
+  fi
+
   log "Stopping common runtimes and network utilities before opening update window"
   pkill -u "$target_user" -f "python" 2>/dev/null || true
   pkill -u "$target_user" -f "btcli" 2>/dev/null || true
@@ -738,6 +775,11 @@ update_btcli_and_wallet() {
   chown "$target_user":"$(id -gn "$target_user")" "$tmpdir"
   chmod 0700 "$tmpdir"
 
+  DOWNLOAD_PACKAGES=("bittensor-cli==${btcli_version}")
+  if [[ -n "$wallet_version" ]]; then
+    DOWNLOAD_PACKAGES+=("bittensor-wallet==${wallet_version}")
+  fi
+
   log "Downloading exact wheels"
   runuser -u "$target_user" -- env \
     HOME="$target_home" \
@@ -747,8 +789,7 @@ update_btcli_and_wallet() {
       --only-binary=:all: \
       --no-deps \
       --dest "$tmpdir" \
-      "bittensor-cli==${btcli_version}" \
-      "bittensor-wallet==${wallet_version}"
+      "${DOWNLOAD_PACKAGES[@]}"
 
   btcli_file="$(find "$tmpdir" -maxdepth 1 -type f -name 'bittensor_cli-*.whl' | head -n1 || true)"
   wallet_file="$(find "$tmpdir" -maxdepth 1 -type f -name 'bittensor_wallet-*.whl' | head -n1 || true)"
@@ -758,13 +799,14 @@ update_btcli_and_wallet() {
     exit 1
   }
 
-  [[ -n "$wallet_file" && -f "$wallet_file" ]] || {
-    echo "Failed to locate downloaded wallet wheel in $tmpdir"
-    exit 1
-  }
+  if [[ -n "$wallet_version" ]]; then
+    [[ -n "$wallet_file" && -f "$wallet_file" ]] || {
+      echo "Failed to locate downloaded wallet wheel in $tmpdir"
+      exit 1
+    }
+  fi
 
   btcli_hash_actual="$(sha256_file "$btcli_file")"
-  wallet_hash_actual="$(sha256_file "$wallet_file")"
 
   log "Verifying btcli wheel hash"
   [[ "$btcli_hash_actual" == "$btcli_hash_expected" ]] || {
@@ -774,13 +816,23 @@ update_btcli_and_wallet() {
     exit 1
   }
 
-  log "Verifying wallet wheel hash"
-  [[ "$wallet_hash_actual" == "$wallet_hash_expected" ]] || {
-    echo "wallet hash mismatch"
-    echo "Expected: $wallet_hash_expected"
-    echo "Actual:   $wallet_hash_actual"
-    exit 1
-  }
+  if [[ -n "$wallet_version" ]]; then
+    wallet_hash_actual="$(sha256_file "$wallet_file")"
+
+    log "Verifying wallet wheel hash"
+    [[ "$wallet_hash_actual" == "$wallet_hash_expected" ]] || {
+      echo "wallet hash mismatch"
+      echo "Expected: $wallet_hash_expected"
+      echo "Actual:   $wallet_hash_actual"
+      exit 1
+    }
+  fi
+
+  INSTALL_FILES=()
+  if [[ -n "$wallet_version" ]]; then
+    INSTALL_FILES+=("$wallet_file")
+  fi
+  INSTALL_FILES+=("$btcli_file")
 
   log "Installing from verified local wheels only"
   runuser -u "$target_user" -- env \
@@ -791,17 +843,20 @@ update_btcli_and_wallet() {
       --user \
       --no-index \
       --no-deps \
-      "$wallet_file" \
-      "$btcli_file"
+      "${INSTALL_FILES[@]}"
 
   log "Verifying installed versions"
   runuser -u "$target_user" -- env \
     HOME="$target_home" \
     PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     "$PYTHON_BIN" - <<'PY'
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
+
 print("bittensor-cli:", version("bittensor-cli"))
-print("bittensor-wallet:", version("bittensor-wallet"))
+try:
+    print("bittensor-wallet:", version("bittensor-wallet"))
+except PackageNotFoundError:
+    print("bittensor-wallet: not installed")
 PY
 
   if [[ -x "${target_home}/.local/bin/btcli" ]]; then
@@ -815,7 +870,11 @@ PY
 
   trap - EXIT
   cleanup
-  log "Strict btcli + wallet update completed"
+  if [[ -n "$wallet_version" ]]; then
+    log "Strict btcli + wallet update completed"
+  else
+    log "Strict btcli-only update completed"
+  fi
 }
 
 ########################################
