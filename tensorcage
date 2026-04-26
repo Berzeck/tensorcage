@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.3.0"
+APP_VERSION="1.3.2"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -54,9 +54,6 @@ BT_DNS_DOMAINS=(
 
 OPENSUSE_DNS_DOMAINS=(
   "opensuse.org."
-  "cdn.opensuse.org."
-  "downloadcontent2.opensuse.org."
-  "mirrorcache.opensuse.org."
   "opensuse.net.br."
   "ufpr.br."
   "usp.br."
@@ -521,7 +518,9 @@ render_squid_conf() {
 
   cat > /etc/squid/squid.conf <<EOF
 visible_hostname ${visible_host}
-http_port ${LOCAL_PROXY_IP}:${SQUID_PORT}
+http_port 127.0.0.1:${SQUID_PORT}
+http_port [::1]:${SQUID_PORT}
+dns_nameservers 127.0.0.1
 via off
 forwarded_for delete
 pinger_enable off
@@ -549,9 +548,16 @@ render_unbound_conf() {
 
   backup_file /etc/unbound/unbound.conf
 
+  local forwarders=""
+  for dns_ip in "${UPSTREAM_DNS_SERVERS[@]}"; do
+    forwarders="${forwarders}  forward-addr: ${dns_ip}\n"
+  done
+
   cat > /etc/unbound/unbound.conf <<EOF
 server:
   interface: ${DNS_LOCAL_IP}
+  interface: ::1
+  access-control: ::1 allow
   port: ${UNBOUND_PORT}
   access-control: 127.0.0.0/8 allow
 
@@ -572,17 +578,11 @@ server:
 
 forward-zone:
   name: "."
-EOF
-
-  local dns_ip
-  for dns_ip in "${UPSTREAM_DNS_SERVERS[@]}"; do
-    echo "  forward-addr: ${dns_ip}" >> /etc/unbound/unbound.conf
-  done
-
-  cat >> /etc/unbound/unbound.conf <<EOF
+$(printf "$forwarders")
 
 include: "/etc/unbound/allowlist/domains.conf"
 EOF
+
 }
 
 render_unbound_allowlist() {
@@ -631,9 +631,25 @@ apply_policy() {
 baseline_setup() {
   print_banner
   confirm_install
+  detect_opensuse_leap
 
-  log "Enabling firewalld"
+  log "Enabling firewalld and clearing previous cage"
   systemctl enable --now firewalld
+
+  # MOVE THE FLUSH HERE (To the very top)
+  firewall-cmd --permanent --direct --remove-rules ipv4 filter OUTPUT || true
+  firewall-cmd --permanent --direct --remove-rules ipv6 filter OUTPUT || true
+  firewall-cmd --reload
+
+  log "Temporarily restoring public DNS for installation"
+  # This ensures zypper can resolve names before Unbound is ready
+  echo "nameserver 1.1.1.1" > /etc/resolv.conf
+
+  log "Opening install gate for root"
+  add_direct_rule_once ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 443 -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 80 -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT
+  firewall-cmd --reload
 
   log "Refreshing repos"
   zypper refresh
@@ -645,6 +661,11 @@ baseline_setup() {
   require_command unbound-checkconf
   require_command netconfig
   require_command proxychains4
+
+  log "Preparing Unbound runtime directory"
+  mkdir -p /run/unbound
+  chown unbound:unbound /run/unbound
+  chmod 0755 /run/unbound
 
   log "Configuring Unbound"
   render_unbound_conf
@@ -677,6 +698,10 @@ EOF
 
   SQUID_UID="$(id -u squid)"
   UNBOUND_UID="$(id -u unbound)"
+
+  # Flush existing TensorCage rules so re-installing doesn't fail
+  firewall-cmd --permanent --direct --remove-rules ipv4 filter OUTPUT || true
+  firewall-cmd --permanent --direct --remove-rules ipv6 filter OUTPUT || true
 
   firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
 
