@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.3.2"
+APP_VERSION="1.4.0"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -21,6 +21,7 @@ OPENSUSE_REL=""
 BTCLI_WSS_PORT="9944"
 LOCAL_PROXY_IP="127.0.0.1"
 SQUID_PORT="3128"
+DANTE_PORT="1080"
 UNBOUND_PORT="53"
 DNS_LOCAL_IP="127.0.0.1"
 
@@ -29,7 +30,7 @@ UPSTREAM_DNS_SERVERS=(
   "8.8.8.8"
 )
 
-SQUID_EGRESS_PORTS=(
+DANTE_EGRESS_PORTS=(
   "80"
   "443"
   "${BTCLI_WSS_PORT}"
@@ -48,8 +49,10 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # Domain allowlists
 ########################################
 
+# raw.githubusercontent.com subdomain is readonly GET method. This allows btcli to fetch the metadata it needs to avoid internal logic timeouts.
 BT_DNS_DOMAINS=(
   "opentensor.ai."
+  "raw.githubusercontent.com."
 )
 
 OPENSUSE_DNS_DOMAINS=(
@@ -90,7 +93,7 @@ Commands:
   os-update Temporarily open openSUSE mirrors, run zypper refresh/update, and re-close
   os-upgrade Temporarily open openSUSE mirrors, run zypper refresh/dup, and re-close
   uninstall Disable TensorCage controls for maintenance; install can reapply cleanly
-  info      Show security, network policy, and Squid activity summary
+  info      Show security, network policy, and Dante/Unbound activity summary
   help      Show this help message
   version   Show version information
 
@@ -439,9 +442,9 @@ confirm_install() {
 }
 
 require_baseline_install() {
-  [[ -f /etc/squid/squid.conf ]] || { echo "TensorCage is not installed: missing /etc/squid/squid.conf"; exit 1; }
+  [[ -f /etc/sockd.conf ]] || { echo "TensorCage is not installed: missing /etc/sockd.conf"; exit 1; }
   [[ -f /etc/unbound/unbound.conf ]] || { echo "TensorCage is not installed: missing /etc/unbound/unbound.conf"; exit 1; }
-  require_command squid
+  require_command sockd
   require_command unbound-checkconf
   require_command proxychains4
 }
@@ -497,50 +500,58 @@ detect_opensuse_leap
 # Render functions
 ########################################
 
-render_squid_conf() {
+render_dante_conf() {
   local allow_pypi="${1:-0}"
   local allow_os="${2:-0}"
-  local visible_host
-  local squid_domains=("${BT_DNS_DOMAINS[@]}")
 
-  require_command squid
-  visible_host="$(get_visible_hostname)"
+  local ext_if
+  ext_if=$(ip -4 route show default | awk '{print $5}' | head -n1)
 
-  if [[ "$allow_os" == "1" ]]; then
-    squid_domains+=("${OPENSUSE_DNS_DOMAINS[@]}")
-  fi
+  cat > /etc/sockd.conf <<EOF
+logoutput: syslog
+errorlog: syslog
 
-  if [[ "$allow_pypi" == "1" ]]; then
-    squid_domains+=("${PYPI_DNS_DOMAINS[@]}")
-  fi
+internal: 127.0.0.1 port = 1080
+external: ${ext_if}
 
-  backup_file /etc/squid/squid.conf
+user.privileged: root
+user.unprivileged: nobody
 
-  cat > /etc/squid/squid.conf <<EOF
-visible_hostname ${visible_host}
-http_port 127.0.0.1:${SQUID_PORT}
-http_port [::1]:${SQUID_PORT}
-dns_nameservers 127.0.0.1
-via off
-forwarded_for delete
-pinger_enable off
+socksmethod: none
+clientmethod: none
 
-acl allowed_domains dstdomain \
-$(build_squid_multiline_acl squid_domains)
+# Allow local traffic to the proxy
+client pass {
+    from: 127.0.0.0/8 to: 0.0.0.0/0
+    log: connect error
+}
 
-acl allowed_tls_sni ssl::server_name \
-$(build_squid_multiline_acl squid_domains)
+# --- THE CIDR REALITY ---
+socks pass {
+    from: 127.0.0.1/32 to: 5.161.0.0/16 port = 443
+    command: connect
+    log: connect error
+}
+socks pass {
+    from: 127.0.0.1/32 to: 5.161.0.0/16 port = ${BTCLI_WSS_PORT}
+    command: connect
+    log: connect error
+}
+socks pass {
+    from: 127.0.0.1/32 to: 185.199.108.0/22 port = 443
+    command: connect
+    log: connect error
+}
 
-acl SSL_ports port 443 ${BTCLI_WSS_PORT}
-http_access deny CONNECT !SSL_ports
+$( [[ "$allow_pypi" == "1" ]] && echo "socks pass { from: 127.0.0.1/32 to: 0.0.0.0/0 port = 443 command: connect log: connect error }" )
 
-http_access allow allowed_domains
-http_access allow CONNECT allowed_tls_sni
-http_access deny all
+# Catch-all block using "socks block"
+socks block {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect error
+}
 EOF
-
-  squid -k parse
-  systemctl reload squid 2>/dev/null || systemctl restart squid
+  systemctl restart sockd
 }
 
 render_unbound_conf() {
@@ -572,9 +583,16 @@ server:
   harden-glue: yes
   harden-dnssec-stripped: yes
   ratelimit: 100
-
   use-syslog: yes
   verbosity: 1
+
+# Cache Tuning for CLI responsiveness
+  prefetch: yes
+  prefetch-key: yes
+  cache-min-ttl: 600
+  serve-expired: yes
+  msg-cache-size: 8m
+  rrset-cache-size: 16m
 
 forward-zone:
   name: "."
@@ -620,7 +638,7 @@ apply_policy() {
   local allow_os="${2:-0}"
 
   log "Applying policy (allow_pypi=${allow_pypi}, allow_os=${allow_os})"
-  render_squid_conf "$allow_pypi" "$allow_os"
+  render_dante_conf "$allow_pypi" "$allow_os"
   render_unbound_allowlist "$allow_pypi" "$allow_os"
 }
 
@@ -639,6 +657,9 @@ baseline_setup() {
   # MOVE THE FLUSH HERE (To the very top)
   firewall-cmd --permanent --direct --remove-rules ipv4 filter OUTPUT || true
   firewall-cmd --permanent --direct --remove-rules ipv6 filter OUTPUT || true
+
+  log "Enabling kernel-level logging for dropped unicast packets"
+  firewall-cmd --set-log-denied=unicast
   firewall-cmd --reload
 
   log "Temporarily restoring public DNS for installation"
@@ -655,9 +676,9 @@ baseline_setup() {
   zypper refresh
 
   log "Installing required packages"
-  zypper install -y squid unbound proxychains-ng bind-utils
+  zypper install -y dante-server unbound proxychains-ng
 
-  require_command squid
+  require_command sockd
   require_command unbound-checkconf
   require_command netconfig
   require_command proxychains4
@@ -681,22 +702,22 @@ EOF
 
   log "Configuring initial policy with PyPI closed"
   render_unbound_allowlist 0 0
-  render_squid_conf 0 0
+  render_dante_conf 0 0
 
   unbound-checkconf /etc/unbound/unbound.conf
 
   log "Starting services"
-  systemctl enable --now squid
+  systemctl enable --now sockd
   systemctl enable --now unbound
 
   log "Configuring firewall rules"
-  local SQUID_UID
+  local DANTE_UID
   local UNBOUND_UID
   local ntp_ip
   local dns_ip
   local port
 
-  SQUID_UID="$(id -u squid)"
+  DANTE_UID="$(id -u nobody)"
   UNBOUND_UID="$(id -u unbound)"
 
   # Flush existing TensorCage rules so re-installing doesn't fail
@@ -718,7 +739,7 @@ EOF
   add_direct_rule_once ipv4 filter OUTPUT 0 -o lo -j ACCEPT
   add_direct_rule_once ipv6 filter OUTPUT 0 -o lo -j ACCEPT
 
-  add_direct_rule_once ipv4 filter OUTPUT 0 -d "${LOCAL_PROXY_IP}" -p tcp --dport "${SQUID_PORT}" -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -d "${LOCAL_PROXY_IP}" -p tcp --dport "${DANTE_PORT}" -j ACCEPT
 
   add_direct_rule_once ipv4 filter OUTPUT 0 -d "${DNS_LOCAL_IP}" -p udp --dport "${UNBOUND_PORT}" -j ACCEPT
   add_direct_rule_once ipv4 filter OUTPUT 0 -d "${DNS_LOCAL_IP}" -p tcp --dport "${UNBOUND_PORT}" -j ACCEPT
@@ -731,8 +752,8 @@ EOF
   add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner root --sport 68 --dport 67 -j ACCEPT
   add_direct_rule_once ipv4 filter INPUT 0 -p udp --sport 67 --dport 68 -j ACCEPT
 
-  for port in "${SQUID_EGRESS_PORTS[@]}"; do
-    add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${SQUID_UID}" -p tcp --dport "${port}" -j ACCEPT
+  for port in "${DANTE_EGRESS_PORTS[@]}"; do
+    add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${DANTE_UID}" -p tcp --dport "${port}" -j ACCEPT
   done
 
   for ntp_ip in "${NTP_IPS[@]}"; do
@@ -741,6 +762,9 @@ EOF
       add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner chrony -d "${ntp_ip}" --dport 123 -j ACCEPT
     fi
   done
+# Log unauthorized outbound attempts right before they hit the DROP rule
+  add_direct_rule_once ipv4 filter OUTPUT 99 -j LOG --log-prefix "TC_DROP: "
+  add_direct_rule_once ipv6 filter OUTPUT 99 -j LOG --log-prefix "TC_DROP: "
 
   add_direct_rule_once ipv4 filter OUTPUT 100 -j DROP
   add_direct_rule_once ipv6 filter OUTPUT 100 -j DROP
@@ -757,7 +781,7 @@ EOF
 
   log "Configuring zypper proxy"
   backup_file /etc/zypp/zypp.conf
-  ensure_line_in_file "proxy=http://${LOCAL_PROXY_IP}:${SQUID_PORT}" /etc/zypp/zypp.conf
+
   if grep -q '^ *download.use_deltarpm' /etc/zypp/zypp.conf; then
     sed -i 's/^ *download\.use_deltarpm.*/download.use_deltarpm = false/' /etc/zypp/zypp.conf
   else
@@ -770,10 +794,10 @@ EOF
   backup_file /etc/proxychains.conf
   cat > /etc/proxychains.conf <<EOF
 strict_chain
-proxy_dns
+# proxy_dns MUST be disabled because Python asyncio loses the fake IP mapping
 
 [ProxyList]
-http ${LOCAL_PROXY_IP} ${SQUID_PORT}
+socks5 127.0.0.1 1080
 EOF
 
   log "Installing btcli wrapper"
@@ -783,13 +807,6 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 exec proxychains4 btcli "$@"
 EOF
   chmod +x /usr/local/bin/btc
-
-  log "Configuring pip proxy"
-  backup_file /etc/pip.conf
-  cat > /etc/pip.conf <<EOF
-[global]
-proxy = http://${LOCAL_PROXY_IP}:${SQUID_PORT}
-EOF
 
   log "Machine secured successfully."
   echo
@@ -805,7 +822,7 @@ uninstall_tensorcage() {
   log "Disabling TensorCage controls for maintenance"
 
   log "Backing up active TensorCage-related configs"
-  backup_file /etc/squid/squid.conf
+  backup_file /etc/sockd.conf
   backup_file /etc/unbound/unbound.conf
   backup_file /etc/zypp/zypp.conf
   backup_file /etc/pip.conf
@@ -813,8 +830,8 @@ uninstall_tensorcage() {
   backup_file /etc/sysconfig/network/config
   backup_file /etc/environment
 
-  log "Stopping Squid and Unbound"
-  systemctl stop squid 2>/dev/null || true
+  log "Stopping Dante and Unbound"
+  systemctl stop sockd 2>/dev/null || true
   systemctl stop unbound 2>/dev/null || true
 
   log "Removing TensorCage outbound firewall direct rules"
@@ -827,8 +844,8 @@ uninstall_tensorcage() {
     mv /etc/profile.d/proxy.sh /etc/profile.d/proxy.sh.disabled
   fi
 
-  sed -i '/127\.0\.0\.1:3128/d;/^http_proxy=/d;/^https_proxy=/d;/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d' /etc/environment 2>/dev/null || true
-  sed -i '/proxy=http:\/\/127\.0\.0\.1:3128/d;/^proxy=/d' /etc/zypp/zypp.conf 2>/dev/null || true
+  sed -i '/127\.0\.0\.1:1080/d;/^http_proxy=/d;/^https_proxy=/d;/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d' /etc/environment 2>/dev/null || true
+  sed -i '/proxy=http:\/\/127\.0\.0\.1:1080/d;/^proxy=/d' /etc/zypp/zypp.conf 2>/dev/null || true
 
   log "Restoring external DNS for maintenance mode"
   local CFG=/etc/sysconfig/network/config
@@ -838,7 +855,7 @@ uninstall_tensorcage() {
 
   log "Disabling pip proxy for maintenance mode"
   if [[ -f /etc/pip.conf ]]; then
-    sed -i '/proxy *= *http:\/\/127\.0\.0\.1:3128/d' /etc/pip.conf 2>/dev/null || true
+    sed -i '/proxy *= *http:\/\/127\.0\.0\.1:1080/d' /etc/pip.conf 2>/dev/null || true
   fi
 
   log "TensorCage disabled for maintenance."
@@ -923,7 +940,7 @@ update_btcli_and_wallet() {
     HOME="$target_home" \
     PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    "$PYTHON_BIN" -m pip download \
+    proxychains4 "$PYTHON_BIN" -m pip download \
       --only-binary=:all: \
       --no-deps \
       --dest "$tmpdir" \
@@ -977,7 +994,7 @@ update_btcli_and_wallet() {
     HOME="$target_home" \
     PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    "$PYTHON_BIN" -m pip install \
+    proxychains4 "$PYTHON_BIN" -m pip install \
       --user \
       --no-index \
       --no-deps \
@@ -1019,19 +1036,47 @@ PY
 ########################################
 # OS update mode
 ########################################
+open_root_maintenance_egress() {
+  log "Opening temporary root egress for maintenance"
+
+  add_direct_rule_once ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 443 -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 80 -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 53 -j ACCEPT
+
+  firewall-cmd --reload
+}
+
+########################################
+# OS update mode
+########################################
 
 os_update() {
   require_baseline_install
 
   cleanup() {
-    log "Re-closing openSUSE update access"
-    apply_policy 0 0 || true
+    log "Re-closing openSUSE maintenance gate"
+    # 1. Remove the ephemeral root egress rules
+    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
+    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+
+    # 2. Restore the strict local DNS cage
+    netconfig update -f >/dev/null 2>&1 || true
   }
 
+  # Ensure the gate closes even if you hit Ctrl+C or Zypper crashes
   trap cleanup EXIT
 
-  log "Temporarily opening openSUSE update access"
-  apply_policy 0 1
+  log "Opening temporary maintenance gate for root"
+  # Add ephemeral rules (Notice the lack of --permanent. These vanish instantly upon removal or reboot)
+  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 443 -j ACCEPT
+  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 80 -j ACCEPT
+  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT
+
+  log "Temporarily bypassing strict DNS for mirror redirects"
+  echo "nameserver 1.1.1.1" > /etc/resolv.conf
+  echo "nameserver 8.8.8.8" >> /etc/resolv.conf
 
   log "Refreshing openSUSE repositories"
   zypper refresh
@@ -1042,33 +1087,41 @@ os_update() {
   trap - EXIT
   cleanup
 
-  log "OS update completed with openSUSE access re-closed"
+  log "OS update completed successfully."
 }
-
 
 os_upgrade() {
   require_baseline_install
 
   cleanup() {
-    log "Re-closing openSUSE upgrade access"
-    apply_policy 0 0 || true
+    log "Re-closing openSUSE maintenance gate"
+    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
+    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+    netconfig update -f >/dev/null 2>&1 || true
   }
 
   trap cleanup EXIT
 
-  log "Temporarily opening openSUSE upgrade access"
-  apply_policy 0 1
+  log "Opening temporary maintenance gate for root"
+  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 443 -j ACCEPT
+  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 80 -j ACCEPT
+  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT
+
+  log "Temporarily bypassing strict DNS for mirror redirects"
+  echo "nameserver 1.1.1.1" > /etc/resolv.conf
+  echo "nameserver 8.8.8.8" >> /etc/resolv.conf
 
   log "Refreshing openSUSE repositories"
   zypper refresh
 
-  log "Starting distribution upgrade using currently configured repositories"
-  zypper dup
+  log "Starting distribution upgrade"
+  zypper dup -y
 
   trap - EXIT
   cleanup
 
-  log "OS upgrade command completed with openSUSE access re-closed"
+  log "OS upgrade command completed successfully."
   echo
   echo "If zypper completed successfully, reboot now:"
   echo "  sudo reboot"
@@ -1077,9 +1130,7 @@ os_upgrade() {
 ########################################
 # Info / diagnostics mode
 ########################################
-
 show_info() {
-  local squid_log="/var/log/squid/access.log"
   local target_user=""
   local target_home=""
 
@@ -1106,7 +1157,7 @@ show_info() {
   echo
 
   echo "[Services]"
-  for svc in firewalld squid unbound; do
+  for svc in firewalld sockd unbound; do
     printf '%-10s enabled=%-10s active=%s\n' \
       "$svc" \
       "$(systemctl is-enabled "$svc" 2>/dev/null || echo unknown)" \
@@ -1114,59 +1165,57 @@ show_info() {
   done
   echo
 
-  echo "[Listening ports: DNS / Squid]"
-  ss -lntup 2>/dev/null | grep -E ":${UNBOUND_PORT}|:${SQUID_PORT}" || echo "No matching listeners found"
+  echo "[Listening ports: DNS / Dante]"
+  ss -lntup 2>/dev/null | grep -E ":${UNBOUND_PORT}|:${DANTE_PORT}" || echo "No matching listeners found"
   echo
 
   echo "[Firewall direct rules]"
   firewall-cmd --direct --get-all-rules 2>/dev/null || echo "Could not read firewalld direct rules"
   echo
 
-  echo "[Squid log summary]"
-  if [[ ! -r "$squid_log" ]]; then
-    echo "Cannot read ${squid_log}"
-    echo "Run as root: sudo ${CLI_NAME} info"
-    return 0
+  echo "[Direct Firewall Drops (Kernel Level)]"
+  journalctl -k --since "1 hour ago" | grep "TC_DROP:" | awk -F 'TC_DROP:' '{print $2}' | tail -n 15 || echo "No direct firewall drops logged."
+  echo
+
+  # --- DANTE LIVE TRAFFIC DASHBOARD ---
+  echo "[Dante Traffic Intel (Last 24 Hours)]"
+  if ! systemctl is-active --quiet sockd; then
+    echo "Dante (sockd) is not currently active."
+  else
+    echo "Analyzing live Dante journal logs..."
+    echo
+
+    echo "Top PERMITTED Destinations (The Allowlist):"
+    echo "-----------------------------------------"
+    journalctl -u sockd --since "1 day ago" --no-pager 2>/dev/null | \
+      grep "pass.*tcp/connect" | \
+      awk -F '-> ' '{print $2}' | \
+      awk '{print $1}' | \
+      sed 's/\.[0-9]*$//' | \
+      sort | uniq -c | sort -nr | head -n 15 || echo "No permitted traffic logged yet."
+
+    echo
+    echo "Top BLOCKED Destinations (The Cage working):"
+    echo "-----------------------------------------"
+    journalctl -u sockd --since "1 day ago" --no-pager 2>/dev/null | \
+      grep "block.*tcp/connect" | \
+      awk -F '-> ' '{print $2}' | \
+      awk '{print $1}' | \
+      sed 's/\.[0-9]*$//' | \
+      sort | uniq -c | sort -nr | head -n 15 || echo "No blocked traffic logged yet."
+
+    echo
+    echo "Most Recent Activity:"
+    echo "-----------------------------------------"
+    journalctl -u sockd -n 10 --no-pager 2>/dev/null | \
+      awk '{for(i=6;i<=NF;i++) printf $i" "; print ""}' || true
   fi
-
   echo
-  echo "Top destinations:"
-  awk '{print $7}' "$squid_log" \
-    | cut -d/ -f3 \
-    | sort \
-    | uniq -c \
-    | sort -nr \
-    | head -n 20
+  # ------------------------------------
 
+  echo "[Unbound recent logs]"
+  journalctl -u unbound --no-pager -n 20 2>/dev/null || echo "Could not read unbound journal"
   echo
-  echo "Denied destinations:"
-  awk 'tolower($0) ~ /denied/ {print $7}' "$squid_log" \
-    | cut -d/ -f3 \
-    | sort \
-    | uniq -c \
-    | sort -nr \
-    | head -n 20
-
-  echo
-  echo "Denied CONNECT attempts:"
-  grep -i "DENIED" "$squid_log" 2>/dev/null \
-    | grep "CONNECT" \
-    | tail -n 20 || true
-
-  echo
-  echo "Direct-IP CONNECT attempts:"
-  grep -E 'CONNECT [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$squid_log" 2>/dev/null \
-    | tail -n 20 || true
-
-  echo
-  echo "Large transfers >100 KB:"
-  awk '$5 > 100000 {print}' "$squid_log" \
-    | tail -n 20
-
-  echo
-  echo "POST/PUT requests:"
-  grep -E " POST | PUT " "$squid_log" 2>/dev/null \
-    | tail -n 20 || true
 
   echo
   echo "[Installed Bittensor packages]"
