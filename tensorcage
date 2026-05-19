@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.4.0"
+APP_VERSION="1.4.1"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -507,6 +507,16 @@ render_dante_conf() {
   local ext_if
   ext_if=$(ip -4 route show default | awk '{print $5}' | head -n1)
 
+  # Pre-format the PyPI rule with proper Dante multi-line syntax
+  local pypi_rule=""
+  if [[ "$allow_pypi" == "1" ]]; then
+    pypi_rule="socks pass {
+    from: 127.0.0.1/32 to: 0.0.0.0/0 port = 443
+    command: connect
+    log: connect error
+}"
+  fi
+
   cat > /etc/sockd.conf <<EOF
 logoutput: syslog
 errorlog: syslog
@@ -543,7 +553,7 @@ socks pass {
     log: connect error
 }
 
-$( [[ "$allow_pypi" == "1" ]] && echo "socks pass { from: 127.0.0.1/32 to: 0.0.0.0/0 port = 443 command: connect log: connect error }" )
+${pypi_rule}
 
 # Catch-all block using "socks block"
 socks block {
@@ -895,8 +905,8 @@ update_btcli_and_wallet() {
   cleanup() {
     log "Re-closing PyPI access"
     apply_policy 0 0 || true
-    if [[ -n "${tmpdir}" && -d "${tmpdir}" ]]; then
-      rm -rf "$tmpdir"
+    if [[ -n "${tmpdir:-}" && -d "${tmpdir:-}" ]]; then
+      rm -rf "${tmpdir:-}"
     fi
   }
 
@@ -941,8 +951,6 @@ update_btcli_and_wallet() {
     PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     proxychains4 "$PYTHON_BIN" -m pip download \
-      --only-binary=:all: \
-      --no-deps \
       --dest "$tmpdir" \
       "${DOWNLOAD_PACKAGES[@]}"
 
@@ -997,8 +1005,7 @@ update_btcli_and_wallet() {
     proxychains4 "$PYTHON_BIN" -m pip install \
       --user \
       --no-index \
-      --no-deps \
-      "${INSTALL_FILES[@]}"
+      "$tmpdir"/*
 
   log "Verifying installed versions"
   runuser -u "$target_user" -- env \
