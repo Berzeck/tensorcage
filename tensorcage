@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.5.7"
+APP_VERSION="1.6.1"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -699,6 +699,9 @@ table inet tensorcage {
     meta skuid unbound ip daddr { 1.1.1.1, 8.8.8.8 } tcp dport 53 accept
     meta skuid nobody tcp dport { 80, 443, 9944 } accept
 
+    # btcli runtime: direct user-scoped egress for asyncio/websocket compatibility
+    meta skuid Berzeck ip daddr 5.161.0.0/16 tcp dport { 443, 9944 } accept
+
     meta skuid root udp sport 68 udp dport 67 accept
     udp sport 67 udp dport 68 accept
 
@@ -736,6 +739,39 @@ EOF
   systemctl enable --now tensorcage-nft.service
 }
 
+open_root_nft_maintenance_gate() {
+  log "Opening temporary nft maintenance gate for root"
+
+  systemctl stop tensorcage-nft.service 2>/dev/null || true
+  nft delete table inet tensorcage 2>/dev/null || true
+
+  cat > /run/tensorcage-maintenance.nft <<'NFT'
+table inet tensorcage {
+  chain output {
+    type filter hook output priority 0; policy accept;
+
+    ct state established,related accept
+    oif "lo" accept
+
+    meta skuid root udp dport 53 accept
+    meta skuid root tcp dport 53 accept
+    meta skuid root tcp dport { 80, 443 } accept
+
+    log prefix "TC_DROP: " drop
+  }
+}
+NFT
+
+  nft -f /run/tensorcage-maintenance.nft
+}
+
+close_root_nft_maintenance_gate() {
+  log "Re-closing temporary nft maintenance gate"
+
+  nft delete table inet tensorcage 2>/dev/null || true
+  systemctl restart tensorcage-nft.service 2>/dev/null || true
+}
+
 ########################################
 # Baseline install/config mode
 ########################################
@@ -760,11 +796,7 @@ baseline_setup() {
   # This ensures zypper can resolve names before Unbound is ready
   echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
-  log "Opening install gate for root"
-  add_direct_rule_once ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 443 -j ACCEPT
-  add_direct_rule_once ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 80 -j ACCEPT
-  add_direct_rule_once ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT
-  firewall-cmd --reload
+  open_root_nft_maintenance_gate
 
   log "Refreshing repos"
   zypper refresh
@@ -1176,14 +1208,12 @@ os_update() {
     netconfig update -f >/dev/null 2>&1 || true
     systemctl restart unbound 2>/dev/null || true
     systemctl restart sockd 2>/dev/null || true
-    systemctl restart tensorcage-nft.service 2>/dev/null || true
+    close_root_nft_maintenance_gate
   }
 
   trap cleanup EXIT
 
-  log "Opening temporary nft maintenance gate for root"
-  systemctl stop tensorcage-nft.service 2>/dev/null || true
-  nft delete table inet tensorcage 2>/dev/null || true
+  open_root_nft_maintenance_gate
 
   log "Temporarily bypassing strict DNS for mirror redirects"
   set_kv "NETCONFIG_DNS_POLICY" "STATIC" /etc/sysconfig/network/config
@@ -1212,14 +1242,12 @@ os_upgrade() {
     netconfig update -f >/dev/null 2>&1 || true
     systemctl restart unbound 2>/dev/null || true
     systemctl restart sockd 2>/dev/null || true
-    systemctl restart tensorcage-nft.service 2>/dev/null || true
+    close_root_nft_maintenance_gate
   }
 
   trap cleanup EXIT
 
-  log "Opening temporary nft maintenance gate for root"
-  systemctl stop tensorcage-nft.service 2>/dev/null || true
-  nft delete table inet tensorcage 2>/dev/null || true
+  open_root_nft_maintenance_gate
 
   log "Temporarily bypassing strict DNS for mirror redirects"
   set_kv "NETCONFIG_DNS_POLICY" "STATIC" /etc/sysconfig/network/config
