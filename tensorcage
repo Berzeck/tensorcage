@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.5.0"
+APP_VERSION="1.5.4"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -681,27 +681,35 @@ configure_nft_containment_service() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-nft add table inet tensorcage 2>/dev/null || true
-nft 'add chain inet tensorcage output { type filter hook output priority 0; policy accept; }' 2>/dev/null || true
-nft flush chain inet tensorcage output
+cat > /run/tensorcage.nft <<'NFT'
+table inet tensorcage {
+  chain output {
+    type filter hook output priority 0; policy accept;
 
-nft add rule inet tensorcage output ct state established,related accept
-nft add rule inet tensorcage output oif lo accept
-nft add rule inet tensorcage output ip daddr 127.0.0.1 udp dport 53 accept
-nft add rule inet tensorcage output ip daddr 127.0.0.1 tcp dport 53 accept
-nft add rule inet tensorcage output ip daddr 127.0.0.1 tcp dport 1080 accept
+    ct state established,related accept
+    oif "lo" accept
 
-nft add rule inet tensorcage output meta skuid unbound ip daddr { 1.1.1.1, 8.8.8.8 } udp dport 53 accept
-nft add rule inet tensorcage output meta skuid unbound ip daddr { 1.1.1.1, 8.8.8.8 } tcp dport 53 accept
-nft add rule inet tensorcage output meta skuid nobody tcp dport { 80, 443, 9944 } accept
+    ip daddr 127.0.0.1 udp dport 53 accept
+    ip daddr 127.0.0.1 tcp dport 53 accept
+    ip daddr 127.0.0.1 tcp dport 1080 accept
 
-nft add rule inet tensorcage output meta skuid root udp sport 68 udp dport 67 accept
-nft add rule inet tensorcage output udp sport 67 udp dport 68 accept
+    meta skuid unbound ip daddr { 1.1.1.1, 8.8.8.8 } udp dport 53 accept
+    meta skuid unbound ip daddr { 1.1.1.1, 8.8.8.8 } tcp dport 53 accept
+    meta skuid nobody tcp dport { 80, 443, 9944 } accept
 
-nft add rule inet tensorcage output meta skuid root ip daddr { 162.159.200.1, 162.159.200.123 } udp dport 123 accept
-nft add rule inet tensorcage output meta skuid chrony ip daddr { 162.159.200.1, 162.159.200.123 } udp dport 123 accept
+    meta skuid root udp sport 68 udp dport 67 accept
+    udp sport 67 udp dport 68 accept
 
-nft add rule inet tensorcage output log prefix "TC_DROP: " drop
+    meta skuid root ip daddr { 162.159.200.1, 162.159.200.123 } udp dport 123 accept
+    meta skuid chrony ip daddr { 162.159.200.1, 162.159.200.123 } udp dport 123 accept
+
+    log prefix "TC_DROP: " drop
+  }
+}
+NFT
+
+nft delete table inet tensorcage 2>/dev/null || true
+nft -f /run/tensorcage.nft
 EOF
 
   chmod 700 /usr/local/sbin/tensorcage-nft-apply
@@ -920,14 +928,21 @@ uninstall_tensorcage() {
   backup_file /etc/sysconfig/network/config
   backup_file /etc/environment
 
-  log "Stopping Dante and Unbound"
-  systemctl stop sockd 2>/dev/null || true
-  systemctl stop unbound 2>/dev/null || true
+  log "Stopping and disabling Dante, Unbound, and TensorCage nft service"
+  systemctl disable --now tensorcage-nft.service 2>/dev/null || true
+  systemctl disable --now sockd 2>/dev/null || true
+  systemctl disable --now unbound 2>/dev/null || true
 
   log "Removing TensorCage outbound firewall direct rules"
   firewall-cmd --permanent --direct --remove-rules ipv4 filter OUTPUT 2>/dev/null || true
   firewall-cmd --permanent --direct --remove-rules ipv6 filter OUTPUT 2>/dev/null || true
-  firewall-cmd --reload 2>/dev/null || true
+
+  log "Removing TensorCage nftables service and boot hooks"
+  rm -f /etc/systemd/system/tensorcage-nft.service
+  rm -f /usr/local/sbin/tensorcage-nft-apply
+  rm -rf /etc/systemd/system/sockd.service.d
+  systemctl daemon-reload
+  nft delete table inet tensorcage 2>/dev/null || true
 
   log "Disabling TensorCage proxy environment"
   if [[ -f /etc/profile.d/proxy.sh ]]; then
@@ -947,6 +962,10 @@ uninstall_tensorcage() {
   if [[ -f /etc/pip.conf ]]; then
     sed -i '/proxy *= *http:\/\/127\.0\.0\.1:1080/d' /etc/pip.conf 2>/dev/null || true
   fi
+
+  log "Restoring firewalld default zone to public"
+  firewall-cmd --set-default-zone=public 2>/dev/null || true
+  firewall-cmd --reload 2>/dev/null || true
 
   log "TensorCage disabled for maintenance."
   echo
@@ -1143,27 +1162,24 @@ os_update() {
 
   cleanup() {
     log "Re-closing openSUSE maintenance gate"
-    # 1. Remove the ephemeral root egress rules
-    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
-    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-
-    # 2. Restore the strict local DNS cage
+    set_kv "NETCONFIG_DNS_POLICY" "STATIC" /etc/sysconfig/network/config
+    set_kv "NETCONFIG_DNS_STATIC_SERVERS" "${DNS_LOCAL_IP}" /etc/sysconfig/network/config
     netconfig update -f >/dev/null 2>&1 || true
+    systemctl restart unbound 2>/dev/null || true
+    systemctl restart sockd 2>/dev/null || true
+    systemctl restart tensorcage-nft.service 2>/dev/null || true
   }
 
-  # Ensure the gate closes even if you hit Ctrl+C or Zypper crashes
   trap cleanup EXIT
 
-  log "Opening temporary maintenance gate for root"
-  # Add ephemeral rules (Notice the lack of --permanent. These vanish instantly upon removal or reboot)
-  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 443 -j ACCEPT
-  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 80 -j ACCEPT
-  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT
+  log "Opening temporary nft maintenance gate for root"
+  systemctl stop tensorcage-nft.service 2>/dev/null || true
+  nft delete table inet tensorcage 2>/dev/null || true
 
   log "Temporarily bypassing strict DNS for mirror redirects"
-  echo "nameserver 1.1.1.1" > /etc/resolv.conf
-  echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+  set_kv "NETCONFIG_DNS_POLICY" "STATIC" /etc/sysconfig/network/config
+  set_kv "NETCONFIG_DNS_STATIC_SERVERS" "1.1.1.1 8.8.8.8" /etc/sysconfig/network/config
+  netconfig update -f || true
 
   log "Refreshing openSUSE repositories"
   zypper refresh
@@ -1182,22 +1198,24 @@ os_upgrade() {
 
   cleanup() {
     log "Re-closing openSUSE maintenance gate"
-    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
-    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-    firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+    set_kv "NETCONFIG_DNS_POLICY" "STATIC" /etc/sysconfig/network/config
+    set_kv "NETCONFIG_DNS_STATIC_SERVERS" "${DNS_LOCAL_IP}" /etc/sysconfig/network/config
     netconfig update -f >/dev/null 2>&1 || true
+    systemctl restart unbound 2>/dev/null || true
+    systemctl restart sockd 2>/dev/null || true
+    systemctl restart tensorcage-nft.service 2>/dev/null || true
   }
 
   trap cleanup EXIT
 
-  log "Opening temporary maintenance gate for root"
-  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 443 -j ACCEPT
-  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p tcp --dport 80 -j ACCEPT
-  firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT
+  log "Opening temporary nft maintenance gate for root"
+  systemctl stop tensorcage-nft.service 2>/dev/null || true
+  nft delete table inet tensorcage 2>/dev/null || true
 
   log "Temporarily bypassing strict DNS for mirror redirects"
-  echo "nameserver 1.1.1.1" > /etc/resolv.conf
-  echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+  set_kv "NETCONFIG_DNS_POLICY" "STATIC" /etc/sysconfig/network/config
+  set_kv "NETCONFIG_DNS_STATIC_SERVERS" "1.1.1.1 8.8.8.8" /etc/sysconfig/network/config
+  netconfig update -f || true
 
   log "Refreshing openSUSE repositories"
   zypper refresh
