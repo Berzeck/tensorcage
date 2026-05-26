@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.4.1"
+APP_VERSION="1.4.2"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -43,7 +43,7 @@ NTP_IPS=(
   "162.159.200.123"
 )
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/tensorcage/venv/bin/python}"
 
 ########################################
 # Domain allowlists
@@ -446,7 +446,7 @@ require_baseline_install() {
   [[ -f /etc/unbound/unbound.conf ]] || { echo "TensorCage is not installed: missing /etc/unbound/unbound.conf"; exit 1; }
   require_command sockd
   require_command unbound-checkconf
-  require_command proxychains4
+  require_command socksify
 }
 
 configure_repos() {
@@ -543,6 +543,11 @@ socks pass {
     log: connect error
 }
 socks pass {
+    from: 127.0.0.1/32 to: 76.76.21.0/24 port = 443
+    command: connect
+    log: connect error
+}
+socks pass {
     from: 127.0.0.1/32 to: 5.161.0.0/16 port = ${BTCLI_WSS_PORT}
     command: connect
     log: connect error
@@ -577,8 +582,6 @@ render_unbound_conf() {
   cat > /etc/unbound/unbound.conf <<EOF
 server:
   interface: ${DNS_LOCAL_IP}
-  interface: ::1
-  access-control: ::1 allow
   port: ${UNBOUND_PORT}
   access-control: 127.0.0.0/8 allow
 
@@ -639,6 +642,9 @@ render_unbound_allowlist() {
     echo '  local-zone: "." refuse'
   } > /etc/unbound/allowlist/domains.conf
 
+  mkdir -p /run/unbound
+  chown unbound:unbound /run/unbound
+  chmod 0755 /run/unbound
   unbound-checkconf /etc/unbound/unbound.conf
   systemctl restart unbound
 }
@@ -686,12 +692,12 @@ baseline_setup() {
   zypper refresh
 
   log "Installing required packages"
-  zypper install -y dante-server unbound proxychains-ng
+  zypper install -y dante-server unbound dante
 
   require_command sockd
   require_command unbound-checkconf
   require_command netconfig
-  require_command proxychains4
+  require_command socksify
 
   log "Preparing Unbound runtime directory"
   mkdir -p /run/unbound
@@ -714,6 +720,9 @@ EOF
   render_unbound_allowlist 0 0
   render_dante_conf 0 0
 
+  mkdir -p /run/unbound
+  chown unbound:unbound /run/unbound
+  chmod 0755 /run/unbound
   unbound-checkconf /etc/unbound/unbound.conf
 
   log "Starting services"
@@ -800,21 +809,21 @@ EOF
 
   configure_repos
 
-  log "Configuring proxychains"
-  backup_file /etc/proxychains.conf
-  cat > /etc/proxychains.conf <<EOF
-strict_chain
-# proxy_dns MUST be disabled because Python asyncio loses the fake IP mapping
-
-[ProxyList]
-socks5 127.0.0.1 1080
+  log "Configuring Dante socksify client"
+  backup_file /etc/socks.conf
+  cat > /etc/socks.conf <<EOF
+route {
+  from: 0.0.0.0/0 to: 0.0.0.0/0 via: 127.0.0.1 port = 1080
+  proxyprotocol: socks_v5
+  method: none
+}
 EOF
 
   log "Installing btcli wrapper"
   cat > /usr/local/bin/btc <<'EOF'
 #!/usr/bin/env bash
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-exec proxychains4 btcli "$@"
+exec socksify btcli "$@"
 EOF
   chmod +x /usr/local/bin/btc
 
@@ -836,7 +845,7 @@ uninstall_tensorcage() {
   backup_file /etc/unbound/unbound.conf
   backup_file /etc/zypp/zypp.conf
   backup_file /etc/pip.conf
-  backup_file /etc/proxychains.conf
+  backup_file /etc/socks.conf
   backup_file /etc/sysconfig/network/config
   backup_file /etc/environment
 
@@ -950,7 +959,7 @@ update_btcli_and_wallet() {
     HOME="$target_home" \
     PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    proxychains4 "$PYTHON_BIN" -m pip download \
+    socksify "$PYTHON_BIN" -m pip download \
       --dest "$tmpdir" \
       "${DOWNLOAD_PACKAGES[@]}"
 
@@ -1002,7 +1011,7 @@ update_btcli_and_wallet() {
     HOME="$target_home" \
     PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    proxychains4 "$PYTHON_BIN" -m pip install \
+    socksify "$PYTHON_BIN" -m pip install \
       --user \
       --no-index \
       "$tmpdir"/*
@@ -1282,3 +1291,4 @@ case "$COMMAND" in
     exit 1
     ;;
 esac
+
