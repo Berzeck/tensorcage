@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.5.4"
+APP_VERSION="1.5.7"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -324,10 +324,12 @@ require_command() {
 }
 
 get_target_user() {
-  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+  if [[ -n "${TENSORCAGE_USER:-}" ]]; then
+    printf '%s\n' "$TENSORCAGE_USER"
+  elif [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
     printf '%s\n' "$SUDO_USER"
   else
-    printf '%s\n' "${USER}"
+    printf '%s\n' "root"
   fi
 }
 
@@ -902,7 +904,7 @@ EOF
   cat > /usr/local/bin/btc <<'EOF'
 #!/usr/bin/env bash
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-exec socksify btcli "$@"
+exec /opt/tensorcage/venv/bin/btcli "$@"
 EOF
   chmod +x /usr/local/bin/btc
 
@@ -1001,6 +1003,14 @@ update_btcli_and_wallet() {
   target_user="$(get_target_user)"
   target_home="$(get_target_home "$target_user")"
 
+  if [[ "$target_user" == "root" ]]; then
+    echo "Refusing to install btcli as root."
+    echo "Run with sudo from a normal user, or set TENSORCAGE_USER=<username>."
+    echo "Example:"
+    echo "  TENSORCAGE_USER=Berzeck sudo -E ${CLI_NAME} update btcli=<version> btcli_hash=<sha256>"
+    exit 1
+  fi
+
   cleanup() {
     log "Re-closing PyPI access"
     apply_policy 0 0 || true
@@ -1097,12 +1107,11 @@ update_btcli_and_wallet() {
   INSTALL_FILES+=("$btcli_file")
 
   log "Installing from verified local wheels only"
-  runuser -u "$target_user" -- env \
+  env \
     HOME="$target_home" \
-    PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    socksify "$PYTHON_BIN" -m pip install \
-      --user \
+    "$PYTHON_BIN" -m pip install \
       --no-index \
       "$tmpdir"/*
 
@@ -1120,13 +1129,13 @@ except PackageNotFoundError:
     print("bittensor-wallet: not installed")
 PY
 
-  if [[ -x "${target_home}/.local/bin/btcli" ]]; then
+  if [[ -x "/opt/tensorcage/venv/bin/btcli" ]]; then
     runuser -u "$target_user" -- env \
       HOME="$target_home" \
-      PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-      "${target_home}/.local/bin/btcli" --version || true
+      PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
+      "/opt/tensorcage/venv/bin/btcli" --version || true
   else
-    echo "Warning: ${target_home}/.local/bin/btcli not found after install."
+    echo "Warning: /opt/tensorcage/venv/bin/btcli not found after install."
   fi
 
   trap - EXIT
@@ -1380,4 +1389,5 @@ case "$COMMAND" in
     exit 1
     ;;
 esac
+
 
