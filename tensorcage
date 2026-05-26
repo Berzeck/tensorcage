@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.4.2"
+APP_VERSION="1.5.0"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -658,6 +658,74 @@ apply_policy() {
   render_unbound_allowlist "$allow_pypi" "$allow_os"
 }
 
+
+configure_sockd_systemd_override() {
+  log "Configuring sockd startup ordering"
+  mkdir -p /etc/systemd/system/sockd.service.d
+  cat > /etc/systemd/system/sockd.service.d/override.conf <<'EOF'
+[Unit]
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Restart=on-failure
+RestartSec=5
+EOF
+  systemctl daemon-reload
+}
+
+configure_nft_containment_service() {
+  log "Configuring persistent nftables containment service"
+
+  cat > /usr/local/sbin/tensorcage-nft-apply <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+nft add table inet tensorcage 2>/dev/null || true
+nft 'add chain inet tensorcage output { type filter hook output priority 0; policy accept; }' 2>/dev/null || true
+nft flush chain inet tensorcage output
+
+nft add rule inet tensorcage output ct state established,related accept
+nft add rule inet tensorcage output oif lo accept
+nft add rule inet tensorcage output ip daddr 127.0.0.1 udp dport 53 accept
+nft add rule inet tensorcage output ip daddr 127.0.0.1 tcp dport 53 accept
+nft add rule inet tensorcage output ip daddr 127.0.0.1 tcp dport 1080 accept
+
+nft add rule inet tensorcage output meta skuid unbound ip daddr { 1.1.1.1, 8.8.8.8 } udp dport 53 accept
+nft add rule inet tensorcage output meta skuid unbound ip daddr { 1.1.1.1, 8.8.8.8 } tcp dport 53 accept
+nft add rule inet tensorcage output meta skuid nobody tcp dport { 80, 443, 9944 } accept
+
+nft add rule inet tensorcage output meta skuid root udp sport 68 udp dport 67 accept
+nft add rule inet tensorcage output udp sport 67 udp dport 68 accept
+
+nft add rule inet tensorcage output meta skuid root ip daddr { 162.159.200.1, 162.159.200.123 } udp dport 123 accept
+nft add rule inet tensorcage output meta skuid chrony ip daddr { 162.159.200.1, 162.159.200.123 } udp dport 123 accept
+
+nft add rule inet tensorcage output log prefix "TC_DROP: " drop
+EOF
+
+  chmod 700 /usr/local/sbin/tensorcage-nft-apply
+
+  cat > /etc/systemd/system/tensorcage-nft.service <<'EOF'
+[Unit]
+Description=Apply TensorCage nftables outbound containment
+After=network-pre.target
+Before=network-online.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tensorcage-nft-apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now tensorcage-nft.service
+}
+
 ########################################
 # Baseline install/config mode
 ########################################
@@ -790,6 +858,9 @@ EOF
 
   firewall-cmd --set-default-zone=drop
   firewall-cmd --reload
+
+  configure_sockd_systemd_override
+  configure_nft_containment_service
 
   log "Configuring netconfig DNS"
   local CFG=/etc/sysconfig/network/config
