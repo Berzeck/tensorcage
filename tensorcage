@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.6.1"
+APP_VERSION="1.7.0"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -79,7 +79,7 @@ ${APP_NAME} ${APP_VERSION}
 
 Usage:
   ${CLI_NAME} install
-  ${CLI_NAME} update btcli=<version> btcli_hash=<sha256> [wallet=<version> wallet_hash=<sha256>]
+  ${CLI_NAME} update bittensor=<version> bittensor_hash=<sha256>
   ${CLI_NAME} os-update
   ${CLI_NAME} os-upgrade
   ${CLI_NAME} uninstall
@@ -89,7 +89,7 @@ Usage:
 
 Commands:
   install   Apply baseline hardening and configure the host
-  update    Temporarily open PyPI, download exact wheels, verify SHA256, and install
+  update    Temporarily open PyPI, download Bittensor 11+, verify SHA256, and install
   os-update Temporarily open openSUSE mirrors, run zypper refresh/update, and re-close
   os-upgrade Temporarily open openSUSE mirrors, run zypper refresh/dup, and re-close
   uninstall Disable TensorCage controls for maintenance; install can reapply cleanly
@@ -106,15 +106,9 @@ Examples:
 
   sudo ${CLI_NAME} uninstall
 
-  sudo ${CLI_NAME} update \\
-    btcli=9.20.0 \\
-    btcli_hash=<sha256>
-
-  sudo ${CLI_NAME} update \\
-    btcli=9.20.0 \\
-    wallet=4.0.0 \\
-    btcli_hash=<sha256> \\
-    wallet_hash=<sha256>
+  sudo ${CLI_NAME} update \
+    bittensor=11.0.0 \
+    bittensor_hash=<sha256>
 EOF
 }
 
@@ -133,10 +127,8 @@ if [[ $# -gt 0 ]]; then
   shift
 fi
 
-BTCLI_VERSION=""
-WALLET_VERSION=""
-BTCLI_HASH=""
-WALLET_HASH=""
+BITTENSOR_VERSION=""
+BITTENSOR_HASH=""
 
 case "${COMMAND}" in
   install)
@@ -150,18 +142,8 @@ case "${COMMAND}" in
   update)
     for arg in "$@"; do
       case "$arg" in
-        btcli=*)
-          BTCLI_VERSION="${arg#btcli=}"
-          ;;
-        wallet=*)
-          WALLET_VERSION="${arg#wallet=}"
-          ;;
-        btcli_hash=*)
-          BTCLI_HASH="${arg#btcli_hash=}"
-          ;;
-        wallet_hash=*)
-          WALLET_HASH="${arg#wallet_hash=}"
-          ;;
+        bittensor=*) BITTENSOR_VERSION="${arg#bittensor=}" ;;
+        bittensor_hash=*) BITTENSOR_HASH="${arg#bittensor_hash=}" ;;
         *)
           echo "Unknown update argument: $arg"
           echo
@@ -171,26 +153,10 @@ case "${COMMAND}" in
       esac
     done
 
-    [[ -n "$BTCLI_VERSION" ]] || { echo "Missing required arg: btcli=<version>"; exit 1; }
-    [[ -n "$BTCLI_HASH" ]] || { echo "Missing required arg: btcli_hash=<sha256>"; exit 1; }
-
-    if [[ -n "$WALLET_VERSION" && -z "$WALLET_HASH" ]]; then
-      echo "wallet_hash is required if wallet version is provided"
-      exit 1
-    fi
-
-    if [[ -z "$WALLET_VERSION" && -n "$WALLET_HASH" ]]; then
-      echo "wallet version is required if wallet_hash is provided"
-      exit 1
-    fi
-
-    validate_version "$BTCLI_VERSION" || { echo "Invalid btcli version: $BTCLI_VERSION"; exit 1; }
-    validate_sha256 "$BTCLI_HASH" || { echo "Invalid btcli SHA256: $BTCLI_HASH"; exit 1; }
-
-    if [[ -n "$WALLET_VERSION" ]]; then
-      validate_version "$WALLET_VERSION" || { echo "Invalid wallet version: $WALLET_VERSION"; exit 1; }
-      validate_sha256 "$WALLET_HASH" || { echo "Invalid wallet SHA256: $WALLET_HASH"; exit 1; }
-    fi
+    [[ -n "$BITTENSOR_VERSION" ]] || { echo "Missing required arg: bittensor=<version>"; exit 1; }
+    [[ -n "$BITTENSOR_HASH" ]] || { echo "Missing required arg: bittensor_hash=<sha256>"; exit 1; }
+    validate_version "$BITTENSOR_VERSION" || { echo "Invalid bittensor version: $BITTENSOR_VERSION"; exit 1; }
+    validate_sha256 "$BITTENSOR_HASH" || { echo "Invalid bittensor SHA256: $BITTENSOR_HASH"; exit 1; }
     ;;
   os-update)
     if [[ $# -ne 0 ]]; then
@@ -556,6 +522,16 @@ socks pass {
 }
 socks pass {
     from: 127.0.0.1/32 to: 185.199.108.0/22 port = 443
+    command: connect
+    log: connect error
+}
+socks pass {
+    from: 127.0.0.1/32 to: 65.109.0.0/16 port = 443
+    command: connect
+    log: connect error
+}
+socks pass {
+    from: 127.0.0.1/32 to: 65.109.0.0/16 port = ${BTCLI_WSS_PORT}
     command: connect
     log: connect error
 }
@@ -1014,21 +990,15 @@ uninstall_tensorcage() {
 # Update mode
 ########################################
 
-update_btcli_and_wallet() {
-  local btcli_version="$1"
-  local wallet_version="$2"
-  local btcli_hash_expected="$3"
-  local wallet_hash_expected="$4"
+update_bittensor() {
+  local bittensor_version="$1"
+  local bittensor_hash_expected="$2"
 
   local target_user
   local target_home
   local tmpdir=""
-  local btcli_file=""
-  local wallet_file=""
-  local btcli_hash_actual=""
-  local wallet_hash_actual=""
-  local -a DOWNLOAD_PACKAGES=()
-  local -a INSTALL_FILES=()
+  local bittensor_file=""
+  local bittensor_hash_actual=""
 
   require_baseline_install
 
@@ -1036,10 +1006,10 @@ update_btcli_and_wallet() {
   target_home="$(get_target_home "$target_user")"
 
   if [[ "$target_user" == "root" ]]; then
-    echo "Refusing to install btcli as root."
+    echo "Refusing to install Bittensor as root."
     echo "Run with sudo from a normal user, or set TENSORCAGE_USER=<username>."
     echo "Example:"
-    echo "  TENSORCAGE_USER=Berzeck sudo -E ${CLI_NAME} update btcli=<version> btcli_hash=<sha256>"
+    echo "  TENSORCAGE_USER=Berzeck sudo -E ${CLI_NAME} update bittensor=<version> bittensor_hash=<sha256>"
     exit 1
   fi
 
@@ -1060,11 +1030,7 @@ update_btcli_and_wallet() {
     exit 1
   fi
 
-  if [[ -n "$wallet_version" ]]; then
-    log "Update mode: bittensor-cli + bittensor-wallet"
-  else
-    log "Update mode: bittensor-cli ONLY (wallet unchanged)"
-  fi
+  log "Update mode: unified bittensor package (Bittensor 11+)"
 
   log "Stopping common runtimes and network utilities before opening update window"
   pkill -u "$target_user" -f "python" 2>/dev/null || true
@@ -1077,108 +1043,91 @@ update_btcli_and_wallet() {
   log "Temporarily opening PyPI access"
   apply_policy 1 0
 
-  tmpdir="$(mktemp -d /tmp/btcli-update.XXXXXX)"
+  tmpdir="$(mktemp -d /tmp/bittensor-update.XXXXXX)"
   chown "$target_user":"$(id -gn "$target_user")" "$tmpdir"
   chmod 0700 "$tmpdir"
 
-  DOWNLOAD_PACKAGES=("bittensor-cli==${btcli_version}")
-  if [[ -n "$wallet_version" ]]; then
-    DOWNLOAD_PACKAGES+=("bittensor-wallet==${wallet_version}")
-  fi
-
-  log "Downloading exact wheels"
+  log "Downloading exact Bittensor release and its dependency wheels"
   runuser -u "$target_user" -- env \
     HOME="$target_home" \
     PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     socksify "$PYTHON_BIN" -m pip download \
+      --only-binary=:all: \
       --dest "$tmpdir" \
-      "${DOWNLOAD_PACKAGES[@]}"
+      "bittensor==${bittensor_version}"
 
-  btcli_file="$(find "$tmpdir" -maxdepth 1 -type f -name 'bittensor_cli-*.whl' | head -n1 || true)"
-  wallet_file="$(find "$tmpdir" -maxdepth 1 -type f -name 'bittensor_wallet-*.whl' | head -n1 || true)"
+  bittensor_file="$(find "$tmpdir" -maxdepth 1 -type f -name 'bittensor-*.whl' | head -n1 || true)"
 
-  [[ -n "$btcli_file" && -f "$btcli_file" ]] || {
-    echo "Failed to locate downloaded btcli wheel in $tmpdir"
+  [[ -n "$bittensor_file" && -f "$bittensor_file" ]] || {
+    echo "Failed to locate the downloaded bittensor wheel in $tmpdir"
     exit 1
   }
 
-  if [[ -n "$wallet_version" ]]; then
-    [[ -n "$wallet_file" && -f "$wallet_file" ]] || {
-      echo "Failed to locate downloaded wallet wheel in $tmpdir"
-      exit 1
-    }
-  fi
+  bittensor_hash_actual="$(sha256_file "$bittensor_file")"
 
-  btcli_hash_actual="$(sha256_file "$btcli_file")"
-
-  log "Verifying btcli wheel hash"
-  [[ "$btcli_hash_actual" == "$btcli_hash_expected" ]] || {
-    echo "btcli hash mismatch"
-    echo "Expected: $btcli_hash_expected"
-    echo "Actual:   $btcli_hash_actual"
+  log "Verifying Bittensor wheel hash"
+  [[ "$bittensor_hash_actual" == "$bittensor_hash_expected" ]] || {
+    echo "Bittensor hash mismatch"
+    echo "Expected: $bittensor_hash_expected"
+    echo "Actual:   $bittensor_hash_actual"
     exit 1
   }
 
-  if [[ -n "$wallet_version" ]]; then
-    wallet_hash_actual="$(sha256_file "$wallet_file")"
+  log "Removing superseded standalone CLI and wallet packages"
+  env \
+    HOME="$target_home" \
+    PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    "$PYTHON_BIN" -m pip uninstall -y \
+      bittensor-cli \
+      bittensor-wallet || true
 
-    log "Verifying wallet wheel hash"
-    [[ "$wallet_hash_actual" == "$wallet_hash_expected" ]] || {
-      echo "wallet hash mismatch"
-      echo "Expected: $wallet_hash_expected"
-      echo "Actual:   $wallet_hash_actual"
-      exit 1
-    }
-  fi
-
-  INSTALL_FILES=()
-  if [[ -n "$wallet_version" ]]; then
-    INSTALL_FILES+=("$wallet_file")
-  fi
-  INSTALL_FILES+=("$btcli_file")
-
-  log "Installing from verified local wheels only"
+  log "Installing Bittensor from the locally downloaded wheel set"
   env \
     HOME="$target_home" \
     PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     "$PYTHON_BIN" -m pip install \
       --no-index \
-      "$tmpdir"/*
+      --find-links "$tmpdir" \
+      "bittensor==${bittensor_version}"
 
-  log "Verifying installed versions"
-  runuser -u "$target_user" -- env \
-    HOME="$target_home" \
-    PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    "$PYTHON_BIN" - <<'PY'
+  log "Verifying the installed Bittensor version"
+  BITTENSOR_EXPECTED_VERSION="$bittensor_version" \
+    "$PYTHON_BIN" - <<'TENSORCAGE_VERIFY_PY'
+import os
 from importlib.metadata import PackageNotFoundError, version
 
-print("bittensor-cli:", version("bittensor-cli"))
-try:
-    print("bittensor-wallet:", version("bittensor-wallet"))
-except PackageNotFoundError:
-    print("bittensor-wallet: not installed")
-PY
+expected = os.environ["BITTENSOR_EXPECTED_VERSION"]
+actual = version("bittensor")
+print(f"bittensor: {actual}")
+if actual != expected:
+    raise SystemExit(f"Installed Bittensor version mismatch: expected {expected}, got {actual}")
+
+for legacy in ("bittensor-cli", "bittensor-wallet"):
+    try:
+        legacy_version = version(legacy)
+    except PackageNotFoundError:
+        print(f"{legacy}: not installed")
+    else:
+        raise SystemExit(f"Superseded package still installed: {legacy} {legacy_version}")
+TENSORCAGE_VERIFY_PY
 
   if [[ -x "/opt/tensorcage/venv/bin/btcli" ]]; then
     runuser -u "$target_user" -- env \
       HOME="$target_home" \
       PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
-      "/opt/tensorcage/venv/bin/btcli" --version || true
+      "/opt/tensorcage/venv/bin/btcli" --version
   else
-    echo "Warning: /opt/tensorcage/venv/bin/btcli not found after install."
+    echo "Bittensor installed, but /opt/tensorcage/venv/bin/btcli was not created."
+    exit 1
   fi
 
   trap - EXIT
   cleanup
-  if [[ -n "$wallet_version" ]]; then
-    log "Strict btcli + wallet update completed"
-  else
-    log "Strict btcli-only update completed"
-  fi
+  log "Strict unified Bittensor update completed"
 }
-
 
 ########################################
 # OS update mode
@@ -1371,7 +1320,7 @@ show_info() {
       "$PYTHON_BIN" - <<'TENSORCAGE_PY' 2>/dev/null || echo "Could not read Python package versions"
 from importlib.metadata import PackageNotFoundError, version
 
-for pkg in ("bittensor-cli", "bittensor-wallet"):
+for pkg in ("bittensor", "bittensor-cli", "bittensor-wallet"):
     try:
         print(f"{pkg}: {version(pkg)}")
     except PackageNotFoundError:
@@ -1406,11 +1355,9 @@ case "$COMMAND" in
     show_info
     ;;
   update)
-    update_btcli_and_wallet \
-      "$BTCLI_VERSION" \
-      "$WALLET_VERSION" \
-      "$BTCLI_HASH" \
-      "$WALLET_HASH"
+    update_bittensor \
+      "$BITTENSOR_VERSION" \
+      "$BITTENSOR_HASH"
     ;;
   *)
     usage
