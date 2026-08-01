@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.7.0"
+APP_VERSION="1.7.1"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -410,11 +410,17 @@ confirm_install() {
 }
 
 require_baseline_install() {
-  [[ -f /etc/sockd.conf ]] || { echo "TensorCage is not installed: missing /etc/sockd.conf"; exit 1; }
-  [[ -f /etc/unbound/unbound.conf ]] || { echo "TensorCage is not installed: missing /etc/unbound/unbound.conf"; exit 1; }
-  require_command sockd
-  require_command unbound-checkconf
-  require_command socksify
+  [[ -f /etc/sockd.conf && ! -L /etc/sockd.conf ]] || {
+    echo "TensorCage is not installed correctly: missing or unsafe /etc/sockd.conf"
+    exit 1
+  }
+  [[ -f /etc/unbound/unbound.conf && ! -L /etc/unbound/unbound.conf ]] || {
+    echo "TensorCage is not installed correctly: missing or unsafe /etc/unbound/unbound.conf"
+    exit 1
+  }
+  [[ -x /usr/sbin/sockd ]] || { echo "Required command not found: /usr/sbin/sockd"; exit 1; }
+  [[ -x /usr/sbin/unbound-checkconf ]] || { echo "Required command not found: /usr/sbin/unbound-checkconf"; exit 1; }
+  [[ -x /usr/bin/socksify ]] || { echo "Required command not found: /usr/bin/socksify"; exit 1; }
 }
 
 configure_repos() {
@@ -545,6 +551,72 @@ socks block {
 }
 EOF
   systemctl restart sockd
+}
+
+render_dante_client_conf() {
+  log "Configuring Dante socksify client"
+
+  if [[ -L /etc/socks.conf ]]; then
+    echo "Refusing to replace symbolic link: /etc/socks.conf"
+    exit 1
+  fi
+
+  backup_file /etc/socks.conf
+
+  local tmpfile
+  tmpfile="$(mktemp /etc/socks.conf.tensorcage.XXXXXX)"
+
+  cat > "$tmpfile" <<EOF
+# Managed by ${APP_NAME} ${APP_VERSION}
+# Route all socksified TCP connections through the local Dante server.
+resolveprotocol: fake
+
+route {
+  from: 0.0.0.0/0 to: 0.0.0.0/0 via: ${LOCAL_PROXY_IP} port = ${DANTE_PORT}
+  command: connect
+  protocol: tcp
+  proxyprotocol: socks_v5
+  method: none
+}
+
+route {
+  from: 0.0.0.0/0 to: . via: ${LOCAL_PROXY_IP} port = ${DANTE_PORT}
+  command: connect
+  protocol: tcp
+  proxyprotocol: socks_v5
+  method: none
+}
+EOF
+
+  chown root:root "$tmpfile"
+  chmod 0644 "$tmpfile"
+  mv -f "$tmpfile" /etc/socks.conf
+}
+
+verify_socksified_python_egress() {
+  local target_user="$1"
+  local target_home="$2"
+
+  log "Verifying Python egress through Dante"
+
+  runuser -u "$target_user" -- env \
+    HOME="$target_home" \
+    PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    SOCKS_CONF='/etc/socks.conf' \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    /usr/bin/socksify "$PYTHON_BIN" - <<'TENSORCAGE_SOCKS_TEST_PY'
+import urllib.request
+
+request = urllib.request.Request(
+    "https://pypi.org/simple/bittensor/",
+    headers={"User-Agent": "TensorCage egress preflight"},
+)
+with urllib.request.urlopen(request, timeout=20) as response:
+    status = response.status
+    print(f"PyPI SOCKS preflight HTTP status: {status}")
+    if status < 200 or status >= 400:
+        raise SystemExit(f"Unexpected PyPI HTTP status: {status}")
+TENSORCAGE_SOCKS_TEST_PY
 }
 
 render_unbound_conf() {
@@ -898,15 +970,7 @@ EOF
 
   configure_repos
 
-  log "Configuring Dante socksify client"
-  backup_file /etc/socks.conf
-  cat > /etc/socks.conf <<EOF
-route {
-  from: 0.0.0.0/0 to: 0.0.0.0/0 via: 127.0.0.1 port = 1080
-  proxyprotocol: socks_v5
-  method: none
-}
-EOF
+  render_dante_client_conf
 
   log "Installing btcli wrapper"
   cat > /usr/local/bin/btc <<'EOF'
@@ -1040,8 +1104,14 @@ update_bittensor() {
   pkill -u "$target_user" -f "curl" 2>/dev/null || true
   pkill -u "$target_user" -f "wget" 2>/dev/null || true
 
+  # Self-heal legacy TensorCage installations that still have the
+  # distribution sample /etc/socks.conf or no client route at all.
+  render_dante_client_conf
+
   log "Temporarily opening PyPI access"
   apply_policy 1 0
+
+  verify_socksified_python_egress "$target_user" "$target_home"
 
   tmpdir="$(mktemp -d /tmp/bittensor-update.XXXXXX)"
   chown "$target_user":"$(id -gn "$target_user")" "$tmpdir"
@@ -1050,9 +1120,10 @@ update_bittensor() {
   log "Downloading exact Bittensor release and its dependency wheels"
   runuser -u "$target_user" -- env \
     HOME="$target_home" \
-    PATH="$target_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    SOCKS_CONF='/etc/socks.conf' \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    socksify "$PYTHON_BIN" -m pip download \
+    /usr/bin/socksify "$PYTHON_BIN" -m pip download \
       --only-binary=:all: \
       --dest "$tmpdir" \
       "bittensor==${bittensor_version}"
@@ -1254,6 +1325,14 @@ show_info() {
       "$(systemctl is-enabled "$svc" 2>/dev/null || echo unknown)" \
       "$(systemctl is-active "$svc" 2>/dev/null || echo unknown)"
   done
+  echo
+
+  echo "[Dante client route]"
+  if [[ -f /etc/socks.conf && ! -L /etc/socks.conf ]]; then
+    grep -nEv '^[[:space:]]*(#|$)' /etc/socks.conf || true
+  else
+    echo "Missing or unsafe /etc/socks.conf"
+  fi
   echo
 
   echo "[Listening ports: DNS / Dante]"
