@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.9.0"
+APP_VERSION="1.9.1"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -46,7 +46,11 @@ NTP_IPS=(
 PYTHON_BIN="${PYTHON_BIN:-/opt/tensorcage/venv/bin/python}"
 
 TENSORCAGE_STATE_DIR="/var/lib/tensorcage"
-INTEGRITY_MANIFEST="${TENSORCAGE_STATE_DIR}/managed-configs.sha256"
+INTEGRITY_MANIFEST="${TENSORCAGE_STATE_DIR}/managed-configs.v2.tsv"
+ROLLBACK_ROOT="${TENSORCAGE_STATE_DIR}/rollback"
+MANIFEST_FORMAT_VERSION="2"
+POLICY_VERSION="5"
+CONFIGURATION_VERSION="5"
 
 ########################################
 # Domain allowlists
@@ -110,7 +114,10 @@ Usage:
   ${CLI_NAME} policy-sync
   ${CLI_NAME} os-update
   ${CLI_NAME} os-upgrade
-  ${CLI_NAME} uninstall
+  ${CLI_NAME} uninstall [--dry-run]
+  ${CLI_NAME} diff
+  ${CLI_NAME} test <dns|proxy|firewall|chrony|python|integrity>
+  ${CLI_NAME} selftest
   ${CLI_NAME} info
   ${CLI_NAME} doctor
   ${CLI_NAME} help
@@ -126,7 +133,10 @@ Commands:
   policy-sync Reapply the closed runtime policy, Dante client, btc wrapper, and nft containment
   os-update Temporarily open openSUSE mirrors, run zypper refresh/update, and re-close
   os-upgrade Temporarily open openSUSE mirrors, run zypper refresh/dup, and re-close
-  uninstall Disable TensorCage controls for maintenance; install can reapply cleanly
+  uninstall Disable TensorCage controls for maintenance; --dry-run only shows the plan
+  diff      Report managed-file content and metadata drift
+  test      Run one focused read-only subsystem test
+  selftest  Run the complete read-only doctor suite
   info      Show security, network policy, and runtime activity summary
   doctor    Run deep, read-only validation of all managed security components
   help      Show this help message
@@ -143,7 +153,13 @@ Examples:
 
   sudo ${CLI_NAME} os-upgrade
 
-  sudo ${CLI_NAME} uninstall
+  sudo ${CLI_NAME} uninstall --dry-run
+
+  sudo ${CLI_NAME} diff
+
+  sudo ${CLI_NAME} test dns
+
+  sudo ${CLI_NAME} selftest
 
   sudo ${CLI_NAME} doctor
 
@@ -183,6 +199,8 @@ BITTENSOR_VERSION=""
 LOCK_FILE=""
 LOCK_HASH=""
 LOCK_OUTPUT=""
+UNINSTALL_DRY_RUN="0"
+TEST_TARGET=""
 
 case "${COMMAND}" in
   install)
@@ -265,12 +283,32 @@ case "${COMMAND}" in
     fi
     ;;
   uninstall)
-    if [[ $# -ne 0 ]]; then
-      echo "uninstall does not accept extra arguments"
+    if [[ $# -gt 1 ]]; then
+      echo "uninstall accepts only optional --dry-run"
       echo
       usage
       exit 1
     fi
+    if [[ $# -eq 1 ]]; then
+      [[ "$1" == "--dry-run" ]] || { echo "Unknown uninstall argument: $1"; exit 1; }
+      UNINSTALL_DRY_RUN="1"
+    fi
+    ;;
+  diff|selftest)
+    if [[ $# -ne 0 ]]; then
+      echo "${COMMAND} does not accept extra arguments"
+      echo
+      usage
+      exit 1
+    fi
+    ;;
+  test)
+    [[ $# -eq 1 ]] || { echo "test requires one target"; usage; exit 1; }
+    TEST_TARGET="$1"
+    case "$TEST_TARGET" in
+      dns|proxy|firewall|chrony|python|integrity) ;;
+      *) echo "Unknown test target: $TEST_TARGET"; usage; exit 1 ;;
+    esac
     ;;
   info)
     if [[ $# -ne 0 ]]; then
@@ -293,7 +331,14 @@ case "${COMMAND}" in
     exit 0
     ;;
   version|-v|--version)
-    echo "${CLI_NAME} ${APP_VERSION}"
+    cat <<EOF
+${APP_NAME}
+Version: ${APP_VERSION}
+Policy: ${POLICY_VERSION}
+Configuration: ${CONFIGURATION_VERSION}
+Manifest format: ${MANIFEST_FORMAT_VERSION}
+Python: ${PYTHON_BIN}
+EOF
     exit 0
     ;;
   *)
@@ -309,7 +354,15 @@ esac
 ########################################
 
 log() {
-  printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
+  printf '\n[%s] INFO     %s\n' "$(date '+%F %T')" "$*"
+}
+
+warn_log() {
+  printf '\n[%s] WARN     %s\n' "$(date '+%F %T')" "$*" >&2
+}
+
+security_log() {
+  printf '\n[%s] SECURITY %s\n' "$(date '+%F %T')" "$*" >&2
 }
 
 backup_file() {
@@ -1289,8 +1342,34 @@ EOF
   echo "Machine secured."
 }
 
+create_rollback_snapshot() {
+  local reason="$1"
+  local stamp=""
+  local destination=""
+  local path=""
+
+  stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+  destination="${ROLLBACK_ROOT}/${stamp}-${reason}"
+  install -d -o root -g root -m 0700 "$destination/files"
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    if [[ -f "$path" && ! -L "$path" ]]; then
+      install -D -o root -g root -m "$(stat -c '%a' "$path")"         "$path" "${destination}/files${path}"
+    fi
+  done < <(managed_integrity_paths)
+
+  firewall-cmd --direct --get-all-rules > "${destination}/firewalld-direct.rules" 2>/dev/null || true
+  nft list table inet tensorcage > "${destination}/tensorcage.nft" 2>/dev/null || true
+  chown -R root:root "$destination"
+  chmod -R go-rwx "$destination"
+  printf '%s\n' "$destination"
+}
+
 sync_runtime_policy() {
   require_baseline_install
+  log "Creating rollback snapshot before policy synchronization"
+  create_rollback_snapshot "policy-sync" >/dev/null
 
   log "Reapplying closed TensorCage runtime policy"
   render_dante_client_conf
@@ -1321,6 +1400,40 @@ sync_runtime_policy() {
 ########################################
 
 uninstall_tensorcage() {
+  local dry_run="${1:-0}"
+
+  if [[ "$dry_run" == "1" ]]; then
+    cat <<EOF
+TensorCage uninstall dry run
+============================
+
+Would disable:
+  tensorcage-nft.service
+  sockd
+  unbound
+
+Would remove TensorCage-managed containment state:
+  /etc/systemd/system/tensorcage-nft.service
+  /usr/local/sbin/tensorcage-nft-apply
+  /etc/systemd/system/sockd.service.d
+  ${TENSORCAGE_STATE_DIR}
+  TensorCage firewalld OUTPUT rules
+  nftables table inet tensorcage
+
+Would preserve:
+  /opt/tensorcage and installed Python packages
+  /usr/local/bin/tensorcage and /usr/local/bin/btc
+  ~/.bittensor wallets and keys
+  journals, package data, and timestamped configuration backups
+
+Would switch DNS and firewalld back to maintenance defaults.
+No changes were made.
+EOF
+    return 0
+  fi
+
+  log "Creating rollback snapshot before uninstall"
+  create_rollback_snapshot "uninstall" >/dev/null || true
   log "Disabling TensorCage controls for maintenance"
 
   log "Backing up active TensorCage-related configs"
@@ -2063,7 +2176,12 @@ refresh_managed_integrity_manifest() {
   local path=""
 
   install -d -o root -g root -m 0700 "$TENSORCAGE_STATE_DIR"
-  tmpfile="$(mktemp "${TENSORCAGE_STATE_DIR}/managed-configs.sha256.XXXXXX")"
+  tmpfile="$(mktemp "${TENSORCAGE_STATE_DIR}/managed-configs.v2.tsv.XXXXXX")"
+
+  printf '# tensorcage-managed-manifest-v%s\n' "$MANIFEST_FORMAT_VERSION" > "$tmpfile"
+  printf '# policy=%s configuration=%s app=%s\n' \
+    "$POLICY_VERSION" "$CONFIGURATION_VERSION" "$APP_VERSION" >> "$tmpfile"
+  printf '# sha256\\tsize\\tmode\\towner\\tgroup\\tpath\n' >> "$tmpfile"
 
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
@@ -2072,7 +2190,13 @@ refresh_managed_integrity_manifest() {
       rm -f "$tmpfile"
       return 1
     fi
-    sha256sum "$path" >> "$tmpfile"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$(sha256_file "$path")" \
+      "$(stat -c '%s' "$path")" \
+      "$(stat -c '%a' "$path")" \
+      "$(stat -c '%U' "$path")" \
+      "$(stat -c '%G' "$path")" \
+      "$path" >> "$tmpfile"
   done < <(managed_integrity_paths)
 
   chown root:root "$tmpfile"
@@ -2086,7 +2210,66 @@ verify_managed_integrity_manifest() {
     return 1
   }
 
-  (cd / && sha256sum --check --strict "$INTEGRITY_MANIFEST")
+  "$PYTHON_BIN" - "$INTEGRITY_MANIFEST" <<'TENSORCAGE_PY'
+import hashlib
+import os
+import stat
+import sys
+from pathlib import Path
+
+manifest = Path(sys.argv[1])
+failures: list[str] = []
+for lineno, raw in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
+    if not raw or raw.startswith("#"):
+        continue
+    fields = raw.split("\t")
+    if len(fields) != 6:
+        failures.append(f"line {lineno}: malformed manifest record")
+        continue
+    expected_hash, expected_size, expected_mode, expected_owner, expected_group, filename = fields
+    path = Path(filename)
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        failures.append(f"MISSING: {filename}")
+        continue
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        failures.append(f"UNSAFE TYPE: {filename}")
+        continue
+    actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    actual_size = str(st.st_size)
+    actual_mode = format(stat.S_IMODE(st.st_mode), "o")
+    import pwd, grp
+    actual_owner = pwd.getpwuid(st.st_uid).pw_name
+    actual_group = grp.getgrgid(st.st_gid).gr_name
+    checks = (
+        ("SHA256", expected_hash, actual_hash),
+        ("SIZE", expected_size, actual_size),
+        ("MODE", expected_mode, actual_mode),
+        ("OWNER", expected_owner, actual_owner),
+        ("GROUP", expected_group, actual_group),
+    )
+    for label, expected, actual in checks:
+        if expected != actual:
+            failures.append(f"{label} MISMATCH: {filename}: expected={expected} actual={actual}")
+if failures:
+    print("\n".join(failures))
+    raise SystemExit(1)
+TENSORCAGE_PY
+}
+
+show_managed_diff() {
+  echo
+  echo "${APP_NAME} managed configuration diff"
+  echo "================================================="
+  if verify_managed_integrity_manifest; then
+    echo "No managed-file content or metadata drift detected."
+    return 0
+  fi
+  echo
+  echo "Drift was detected. The lines above identify exact content or metadata differences."
+  echo "TensorCage does not overwrite drift in diff mode. Run policy-sync/time-sync only after review."
+  return 1
 }
 
 ########################################
@@ -2284,6 +2467,56 @@ run_doctor() {
   return 1
 }
 
+run_focused_test() {
+  local target="$1"
+  case "$target" in
+    dns)
+      dig @127.0.0.1 pypi.org +time=2 +tries=1 2>/dev/null | grep -q 'status: REFUSED' \
+        && echo "PASS: PyPI DNS is closed" \
+        || { echo "FAIL: PyPI DNS is not closed"; return 1; }
+      dig @127.0.0.1 opentensor.ai +short +time=3 +tries=1 | grep -q . \
+        && echo "PASS: Bittensor runtime DNS resolves" \
+        || { echo "FAIL: Bittensor runtime DNS does not resolve"; return 1; }
+      ;;
+    proxy)
+      [[ -x /usr/bin/socksify && -f /etc/socks.conf && ! -L /etc/socks.conf ]] \
+        || { echo "FAIL: Dante client prerequisites missing"; return 1; }
+      systemctl is-active --quiet sockd || { echo "FAIL: sockd inactive"; return 1; }
+      grep -q 'via: 127.0.0.1 port = 1080' /etc/socks.conf \
+        || { echo "FAIL: local SOCKS route missing"; return 1; }
+      echo "PASS: Dante client/server path configured"
+      ;;
+    firewall)
+      firewall-cmd --direct --get-all-rules | grep -q 'ipv4 filter OUTPUT 100 -j DROP' \
+        || { echo "FAIL: IPv4 terminal drop missing"; return 1; }
+      firewall-cmd --direct --get-all-rules | grep -q 'ipv6 filter OUTPUT 100 -j DROP' \
+        || { echo "FAIL: IPv6 terminal drop missing"; return 1; }
+      nft list table inet tensorcage >/dev/null 2>&1 \
+        || { echo "FAIL: TensorCage nftables table missing"; return 1; }
+      echo "PASS: firewall containment present"
+      ;;
+    chrony)
+      LC_ALL=C chronyc tracking | grep -q '^Leap status[[:space:]]*: Normal' \
+        || { echo "FAIL: Chrony not synchronized"; return 1; }
+      LC_ALL=C chronyc -n sources | grep -q '^\^\*' \
+        || { echo "FAIL: no selected Chrony source"; return 1; }
+      echo "PASS: Chrony synchronized"
+      ;;
+    python)
+      [[ -x "$PYTHON_BIN" && -x /opt/tensorcage/venv/bin/btcli ]] \
+        || { echo "FAIL: TensorCage Python or btcli missing"; return 1; }
+      /opt/tensorcage/venv/bin/btcli --version >/dev/null \
+        || { echo "FAIL: unified btcli does not start"; return 1; }
+      echo "PASS: TensorCage Python and btcli runtime"
+      ;;
+    integrity)
+      verify_managed_integrity_manifest \
+        && echo "PASS: managed content and metadata integrity" \
+        || return 1
+      ;;
+  esac
+}
+
 ########################################
 # Info / diagnostics mode
 ########################################
@@ -2305,6 +2538,10 @@ show_info() {
   else
     echo "OS: unknown"
   fi
+  echo "Version: ${APP_VERSION}"
+  echo "Policy version: ${POLICY_VERSION}"
+  echo "Configuration version: ${CONFIGURATION_VERSION}"
+  echo "Manifest format: ${MANIFEST_FORMAT_VERSION}"
   echo "TensorCage Python: ${PYTHON_BIN}"
   if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     "$PYTHON_BIN" --version || true
@@ -2528,6 +2765,9 @@ TENSORCAGE_PY
 }
 
 time_sync_command() {
+  require_baseline_install
+  log "Creating rollback snapshot before time synchronization"
+  create_rollback_snapshot "time-sync" >/dev/null
   configure_chrony
   refresh_managed_integrity_manifest
 }
@@ -2553,7 +2793,16 @@ case "$COMMAND" in
     os_upgrade
     ;;
   uninstall)
-    uninstall_tensorcage
+    uninstall_tensorcage "$UNINSTALL_DRY_RUN"
+    ;;
+  diff)
+    show_managed_diff
+    ;;
+  test)
+    run_focused_test "$TEST_TARGET"
+    ;;
+  selftest)
+    run_doctor
     ;;
   info)
     show_info
