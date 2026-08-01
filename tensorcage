@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.8.1"
+APP_VERSION="1.8.2"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -81,6 +81,7 @@ Usage:
   ${CLI_NAME} install
   ${CLI_NAME} lock-create bittensor=<version> output=<path>
   ${CLI_NAME} update bittensor=<version> lock=<path> lock_hash=<sha256>
+  ${CLI_NAME} time-sync
   ${CLI_NAME} os-update
   ${CLI_NAME} os-upgrade
   ${CLI_NAME} uninstall
@@ -94,6 +95,7 @@ Commands:
               On a secured TensorCage host, run with sudo: PyPI opens only for the
               download window, traffic is routed through Dante, and PyPI is re-closed.
   update    Temporarily open PyPI, verify every wheel against an approved manifest, and install
+  time-sync Manage Chrony with pinned NTP IPs and verify synchronization
   os-update Temporarily open openSUSE mirrors, run zypper refresh/update, and re-close
   os-upgrade Temporarily open openSUSE mirrors, run zypper refresh/dup, and re-close
   uninstall Disable TensorCage controls for maintenance; install can reapply cleanly
@@ -103,6 +105,8 @@ Commands:
 
 Examples:
   sudo ${CLI_NAME} install
+
+  sudo ${CLI_NAME} time-sync
 
   sudo ${CLI_NAME} os-update
 
@@ -194,6 +198,14 @@ case "${COMMAND}" in
     [[ -n "$LOCK_HASH" ]] || { echo "Missing required arg: lock_hash=<sha256>"; exit 1; }
     validate_version "$BITTENSOR_VERSION" || { echo "Invalid bittensor version: $BITTENSOR_VERSION"; exit 1; }
     validate_sha256 "$LOCK_HASH" || { echo "Invalid lock-file SHA256: $LOCK_HASH"; exit 1; }
+    ;;
+  time-sync)
+    if [[ $# -ne 0 ]]; then
+      echo "time-sync does not accept extra arguments"
+      echo
+      usage
+      exit 1
+    fi
     ;;
   os-update)
     if [[ $# -ne 0 ]]; then
@@ -789,6 +801,82 @@ apply_policy() {
 }
 
 
+render_chrony_conf() {
+  require_command chronyd
+
+  log "Configuring Chrony with pinned NTP servers"
+
+  if [[ -L /etc/chrony.conf ]]; then
+    echo "Refusing to replace symbolic link: /etc/chrony.conf"
+    exit 1
+  fi
+
+  backup_file /etc/chrony.conf
+
+  local tmpfile
+  local ntp_ip
+  tmpfile="$(mktemp /etc/chrony.conf.tensorcage.XXXXXX)"
+
+  {
+    echo "# Managed by ${APP_NAME} ${APP_VERSION}"
+    echo "# DNS-independent NTP configuration using pinned server IPs."
+    for ntp_ip in "${NTP_IPS[@]}"; do
+      echo "server ${ntp_ip} iburst"
+    done
+    echo
+    echo "driftfile /var/lib/chrony/drift"
+    echo "makestep 1.0 3"
+    echo "rtcsync"
+    echo "cmdport 0"
+  } > "$tmpfile"
+
+  chown root:root "$tmpfile"
+  chmod 0644 "$tmpfile"
+
+  chronyd -p -f "$tmpfile" >/dev/null
+  mv -f "$tmpfile" /etc/chrony.conf
+}
+
+verify_chrony_sync() {
+  require_command chronyc
+
+  log "Waiting for Chrony synchronization"
+
+  chronyc online >/dev/null 2>&1 || true
+  chronyc burst 4/4 >/dev/null 2>&1 || true
+
+  local attempt
+  local selected='0'
+  for attempt in $(seq 1 30); do
+    if LC_ALL=C chronyc sources 2>/dev/null | grep -q '^[#^][*]'; then
+      selected='1'
+    fi
+
+    if [[ "$selected" == '1' ]] && \
+       LC_ALL=C chronyc tracking 2>/dev/null | grep -q 'Leap status[[:space:]]*:[[:space:]]*Normal'; then
+      chronyc makestep >/dev/null 2>&1 || true
+      log "Chrony synchronized successfully"
+      return 0
+    fi
+
+    sleep 2
+  done
+
+  echo "Chrony could not synchronize with the configured pinned NTP servers."
+  echo
+  chronyc tracking 2>/dev/null || true
+  echo
+  chronyc -n sources -v 2>/dev/null || true
+  return 1
+}
+
+configure_chrony() {
+  render_chrony_conf
+  systemctl enable --now chronyd
+  systemctl restart chronyd
+  verify_chrony_sync
+}
+
 configure_sockd_systemd_override() {
   log "Configuring sockd startup ordering"
   mkdir -p /etc/systemd/system/sockd.service.d
@@ -930,12 +1018,14 @@ baseline_setup() {
   zypper refresh
 
   log "Installing required packages"
-  zypper install -y dante-server unbound dante
+  zypper install -y dante-server unbound dante chrony
 
   require_command sockd
   require_command unbound-checkconf
   require_command netconfig
   require_command socksify
+  require_command chronyd
+  require_command chronyc
 
   log "Preparing Unbound runtime directory"
   mkdir -p /run/unbound
@@ -1031,6 +1121,8 @@ EOF
 
   configure_sockd_systemd_override
   configure_nft_containment_service
+
+  configure_chrony
 
   log "Configuring netconfig DNS"
   local CFG=/etc/sysconfig/network/config
@@ -1811,12 +1903,28 @@ show_info() {
   echo
 
   echo "[Services]"
-  for svc in firewalld sockd unbound; do
+  for svc in firewalld sockd unbound chronyd; do
     printf '%-10s enabled=%-10s active=%s\n' \
       "$svc" \
       "$(systemctl is-enabled "$svc" 2>/dev/null || echo unknown)" \
       "$(systemctl is-active "$svc" 2>/dev/null || echo unknown)"
   done
+  echo
+
+  echo "[Chrony time synchronization]"
+  if command -v chronyc >/dev/null 2>&1; then
+    if LC_ALL=C chronyc tracking >/dev/null 2>&1; then
+      LC_ALL=C chronyc tracking | grep -E \
+        '^(Reference ID|Stratum|Ref time|System time|Last offset|RMS offset|Leap status)' || true
+      echo
+      echo "Selected source:"
+      LC_ALL=C chronyc -n sources 2>/dev/null | awk '$1 ~ /^\^\*/ {print $0}' || true
+    else
+      echo "Chrony is installed but tracking information is unavailable."
+    fi
+  else
+    echo "chronyc not found"
+  fi
   echo
 
   echo "[Dante client route]"
@@ -1937,6 +2045,9 @@ TENSORCAGE_PY
 case "$COMMAND" in
   install)
     baseline_setup
+    ;;
+  time-sync)
+    configure_chrony
     ;;
   os-update)
     os_update
