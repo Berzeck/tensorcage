@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="2.0.1"
+APP_VERSION="2.0.2"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -51,7 +51,7 @@ ROLLBACK_ROOT="${TENSORCAGE_STATE_DIR}/rollback"
 LIFECYCLE_STATE_FILE="${TENSORCAGE_STATE_DIR}/lifecycle.state"
 MANIFEST_FORMAT_VERSION="2"
 POLICY_VERSION="6"
-CONFIGURATION_VERSION="6"
+CONFIGURATION_VERSION="7"
 
 ########################################
 # Domain allowlists
@@ -729,16 +729,21 @@ unset \
   HTTP_PROXY \
   HTTPS_PROXY \
   ALL_PROXY \
-  all_proxy
+  all_proxy \
+  WSS_PROXY \
+  WS_PROXY \
+  NO_PROXY
 
-export SOCKS_CONF='/etc/socks.conf'
+# Bittensor 11 uses websockets' native asynchronous proxy support.
+# SOCKS5h keeps endpoint DNS resolution inside the local Dante path.
+export wss_proxy='socks5h://127.0.0.1:1080'
+export ws_proxy='socks5h://127.0.0.1:1080'
+export no_proxy='127.0.0.1,localhost,::1'
 
 /usr/bin/logger -t tensorcage-btc -- \
-  "uid=$(id -u) pid=$$ invoked unified btcli" 2>/dev/null || true
+  "uid=$(id -u) pid=$$ invoked unified btcli via native SOCKS" 2>/dev/null || true
 
-exec /usr/bin/socksify \
-  /opt/tensorcage/venv/bin/btcli \
-  "$@"
+exec /opt/tensorcage/venv/bin/btcli "$@"
 EOF
 
   chown root:root "$tmpfile"
@@ -1724,7 +1729,8 @@ create_bittensor_lock() {
         --disable-pip-version-check \
         --only-binary=:all: \
         --dest "$tmpdir" \
-        "bittensor==${bittensor_version}"
+        "bittensor==${bittensor_version}" \
+        'python-socks[asyncio]'
   else
     log "Lock-create mode: unrestricted trusted host"
     log "Downloading the exact Bittensor ${bittensor_version} wheel set"
@@ -1732,7 +1738,8 @@ create_bittensor_lock() {
       --disable-pip-version-check \
       --only-binary=:all: \
       --dest "$tmpdir" \
-      "bittensor==${bittensor_version}"
+      "bittensor==${bittensor_version}" \
+      'python-socks[asyncio]'
   fi
 
   log "Generating a complete SHA256 lock manifest"
@@ -1792,6 +1799,8 @@ for wheel in wheel_files:
 
 if "bittensor" not in records:
     raise SystemExit("The wheel set does not contain bittensor")
+if "python-socks" not in records:
+    raise SystemExit("The wheel set does not contain python-socks")
 if records["bittensor"][0] != expected_bittensor:
     raise SystemExit(
         f"Downloaded Bittensor version mismatch: "
@@ -1922,6 +1931,8 @@ if headers.get("platform") != expected_platform:
 
 if "bittensor" not in requirements:
     raise SystemExit("Lock manifest does not contain bittensor")
+if "python-socks" not in requirements:
+    raise SystemExit("Lock manifest does not contain python-socks")
 if requirements["bittensor"][0] != expected_bittensor:
     raise SystemExit("Locked Bittensor requirement has the wrong version")
 if len(requirements) < 2:
@@ -2123,6 +2134,12 @@ actual = version("bittensor")
 print(f"bittensor: {actual}")
 if actual != expected:
     raise SystemExit(f"Installed Bittensor version mismatch: expected {expected}, got {actual}")
+
+try:
+    socks_version = version("python-socks")
+except PackageNotFoundError as exc:
+    raise SystemExit("Required native SOCKS backend is not installed: python-socks") from exc
+print(f"python-socks: {socks_version}")
 
 for legacy in ("bittensor-cli", "bittensor-wallet"):
     try:
@@ -2360,6 +2377,37 @@ show_managed_diff() {
   return 1
 }
 
+verify_native_bittensor_websocket() {
+  local target_user="$1"
+  local target_home="$2"
+
+  timeout 25 runuser -u "$target_user" -- env \
+    HOME="$target_home" \
+    PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    wss_proxy="socks5h://${LOCAL_PROXY_IP}:${DANTE_PORT}" \
+    ws_proxy="socks5h://${LOCAL_PROXY_IP}:${DANTE_PORT}" \
+    no_proxy='127.0.0.1,localhost,::1' \
+    "$PYTHON_BIN" - <<'TENSORCAGE_NATIVE_WS_PY'
+import asyncio
+
+import websockets
+
+
+async def main() -> None:
+    async with websockets.connect(
+        "wss://lite.chain.opentensor.ai:443",
+        open_timeout=15,
+        close_timeout=5,
+        ping_interval=None,
+    ):
+        return
+
+
+asyncio.run(main())
+TENSORCAGE_NATIVE_WS_PY
+}
+
 ########################################
 # Deep doctor mode
 ########################################
@@ -2447,6 +2495,12 @@ run_doctor() {
     doctor_pass "Dante client routes through 127.0.0.1:1080"
   else
     doctor_fail "Dante client route is missing"
+  fi
+  if grep -q "wss_proxy='socks5h://127.0.0.1:1080'" /usr/local/bin/btc \
+    && ! grep -q '/usr/bin/socksify' /usr/local/bin/btc; then
+    doctor_pass "btc uses native asynchronous SOCKS transport"
+  else
+    doctor_fail "btc native SOCKS transport is not configured"
   fi
 
   echo
@@ -2548,9 +2602,19 @@ run_doctor() {
   else
     doctor_fail "btc wrapper missing"
   fi
+  if "$PYTHON_BIN" -c 'from importlib.metadata import version; print(version("python-socks"))' >/dev/null 2>&1; then
+    doctor_pass "python-socks native proxy backend installed"
+  else
+    doctor_fail "python-socks native proxy backend missing"
+  fi
 
   target_user="$(get_target_user)"
   target_home="$(get_target_home "$target_user")"
+  if verify_native_bittensor_websocket "$target_user" "$target_home" >/dev/null 2>&1; then
+    doctor_pass "Bittensor WebSocket handshake succeeds through native SOCKS"
+  else
+    doctor_fail "Bittensor WebSocket handshake through native SOCKS failed"
+  fi
   if [[ -d "${target_home}/.bittensor/wallets" ]]; then
     doctor_pass "wallet directory present for ${target_user}"
   else
@@ -2580,12 +2644,20 @@ run_focused_test() {
         || { echo "FAIL: Bittensor runtime DNS does not resolve"; return 1; }
       ;;
     proxy)
-      [[ -x /usr/bin/socksify && -f /etc/socks.conf && ! -L /etc/socks.conf ]] \
-        || { echo "FAIL: Dante client prerequisites missing"; return 1; }
+      [[ -f /etc/socks.conf && ! -L /etc/socks.conf ]] \
+        || { echo "FAIL: Dante client configuration missing"; return 1; }
       systemctl is-active --quiet sockd || { echo "FAIL: sockd inactive"; return 1; }
       grep -q 'via: 127.0.0.1 port = 1080' /etc/socks.conf \
         || { echo "FAIL: local SOCKS route missing"; return 1; }
-      echo "PASS: Dante client/server path configured"
+      "$PYTHON_BIN" -c 'from importlib.metadata import version; version("python-socks")' \
+        || { echo "FAIL: python-socks missing"; return 1; }
+      grep -q "wss_proxy='socks5h://127.0.0.1:1080'" /usr/local/bin/btc \
+        || { echo "FAIL: btc native SOCKS proxy missing"; return 1; }
+      target_user="$(get_target_user)"
+      target_home="$(get_target_home "$target_user")"
+      verify_native_bittensor_websocket "$target_user" "$target_home" \
+        || { echo "FAIL: native WebSocket path failed"; return 1; }
+      echo "PASS: native asynchronous SOCKS path through Dante"
       ;;
     firewall)
       firewall-cmd --direct --get-all-rules | grep -q 'ipv4 filter OUTPUT 100 -j DROP' \
