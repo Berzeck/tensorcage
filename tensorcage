@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.8.2"
+APP_VERSION="1.8.3"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -49,7 +49,8 @@ PYTHON_BIN="${PYTHON_BIN:-/opt/tensorcage/venv/bin/python}"
 # Domain allowlists
 ########################################
 
-# raw.githubusercontent.com subdomain is readonly GET method. This allows btcli to fetch the metadata it needs to avoid internal logic timeouts.
+# Runtime DNS names required by Bittensor. DNS permission does not imply HTTP-method restriction;
+# Dante still enforces the destination network allowlist below.
 BT_DNS_DOMAINS=(
   "opentensor.ai."
   "raw.githubusercontent.com."
@@ -69,6 +70,27 @@ PYPI_DNS_DOMAINS=(
   "pythonhosted.org."
 )
 
+# Exact hostnames resolved only during the temporary PyPI window.
+# Dante receives /32 rules for the addresses returned at policy-application time,
+# instead of a temporary 0.0.0.0/0:443 pass rule.
+PYPI_EGRESS_HOSTS=(
+  "pypi.org"
+  "files.pythonhosted.org"
+)
+
+# Runtime destination ranges retained for Bittensor compatibility.
+# These are explicit because Dante cannot enforce TLS SNI. Keep this list minimal.
+DANTE_RUNTIME_RULES=(
+  "5.161.0.0/16:443"
+  "76.76.21.0/24:443"
+  "5.161.0.0/16:${BTCLI_WSS_PORT}"
+  "185.199.108.0/22:443"
+  "65.109.0.0/16:443"
+  "65.109.0.0/16:${BTCLI_WSS_PORT}"
+)
+
+CHRONY_MAX_CORRECTION_SECONDS="1.0"
+
 ########################################
 # Usage / argument parsing
 ########################################
@@ -82,6 +104,7 @@ Usage:
   ${CLI_NAME} lock-create bittensor=<version> output=<path>
   ${CLI_NAME} update bittensor=<version> lock=<path> lock_hash=<sha256>
   ${CLI_NAME} time-sync
+  ${CLI_NAME} policy-sync
   ${CLI_NAME} os-update
   ${CLI_NAME} os-upgrade
   ${CLI_NAME} uninstall
@@ -96,6 +119,7 @@ Commands:
               download window, traffic is routed through Dante, and PyPI is re-closed.
   update    Temporarily open PyPI, verify every wheel against an approved manifest, and install
   time-sync Manage Chrony with pinned NTP IPs and verify synchronization
+  policy-sync Reapply the closed runtime policy, Dante client, btc wrapper, and nft containment
   os-update Temporarily open openSUSE mirrors, run zypper refresh/update, and re-close
   os-upgrade Temporarily open openSUSE mirrors, run zypper refresh/dup, and re-close
   uninstall Disable TensorCage controls for maintenance; install can reapply cleanly
@@ -107,6 +131,8 @@ Examples:
   sudo ${CLI_NAME} install
 
   sudo ${CLI_NAME} time-sync
+
+  sudo ${CLI_NAME} policy-sync
 
   sudo ${CLI_NAME} os-update
 
@@ -202,6 +228,14 @@ case "${COMMAND}" in
   time-sync)
     if [[ $# -ne 0 ]]; then
       echo "time-sync does not accept extra arguments"
+      echo
+      usage
+      exit 1
+    fi
+    ;;
+  policy-sync)
+    if [[ $# -ne 0 ]]; then
+      echo "policy-sync does not accept extra arguments"
       echo
       usage
       exit 1
@@ -526,6 +560,47 @@ else
   detect_opensuse_leap
 fi
 
+resolve_ipv4_hosts() {
+  local array_name="$1"
+  local -n hosts_ref="$array_name"
+  local host
+  local address
+  local addresses=()
+
+  require_command getent
+
+  for host in "${hosts_ref[@]}"; do
+    while IFS= read -r address; do
+      [[ -n "$address" ]] && addresses+=("$address")
+    done < <(
+      getent ahostsv4 "$host" 2>/dev/null |
+        awk '$2 == "STREAM" {print $1}' |
+        sort -u
+    )
+  done
+
+  if [[ "${#addresses[@]}" -eq 0 ]]; then
+    echo "No IPv4 addresses could be resolved for: ${hosts_ref[*]}" >&2
+    return 1
+  fi
+
+  printf '%s\n' "${addresses[@]}" | sort -u
+}
+
+append_dante_pass_rule() {
+  local destination="$1"
+  local port="$2"
+  local file="$3"
+
+  cat >> "$file" <<EOF
+socks pass {
+    from: 127.0.0.1/32 to: ${destination} port = ${port}
+    command: connect
+    log: connect error
+}
+EOF
+}
+
 ########################################
 # Render functions
 ########################################
@@ -533,25 +608,46 @@ fi
 render_dante_conf() {
   local allow_pypi="${1:-0}"
   local allow_os="${2:-0}"
-
   local ext_if
-  ext_if=$(ip -4 route show default | awk '{print $5}' | head -n1)
+  local tmpfile
+  local rule
+  local destination
+  local port
+  local pypi_ip
+  local pypi_ips=()
 
-  # Pre-format the PyPI rule with proper Dante multi-line syntax
-  local pypi_rule=""
+  : "$allow_os" # Reserved for future Dante-routed OS maintenance.
+
+  ext_if="$(ip -4 route show default | awk '{print $5}' | head -n1)"
+  [[ -n "$ext_if" ]] || {
+    echo "Could not determine the default IPv4 interface."
+    return 1
+  }
+
   if [[ "$allow_pypi" == "1" ]]; then
-    pypi_rule="socks pass {
-    from: 127.0.0.1/32 to: 0.0.0.0/0 port = 443
-    command: connect
-    log: connect error
-}"
+    while IFS= read -r pypi_ip; do
+      [[ -n "$pypi_ip" ]] && pypi_ips+=("$pypi_ip")
+    done < <(resolve_ipv4_hosts PYPI_EGRESS_HOSTS)
+
+    [[ "${#pypi_ips[@]}" -gt 0 ]] || {
+      echo "Refusing to open PyPI mode without resolved destination addresses."
+      return 1
+    }
   fi
 
-  cat > /etc/sockd.conf <<EOF
+  if [[ -L /etc/sockd.conf ]]; then
+    echo "Refusing to replace symbolic link: /etc/sockd.conf"
+    return 1
+  fi
+
+  backup_file /etc/sockd.conf
+  tmpfile="$(mktemp /etc/sockd.conf.tensorcage.XXXXXX)"
+
+  cat > "$tmpfile" <<EOF
 logoutput: syslog
 errorlog: syslog
 
-internal: 127.0.0.1 port = 1080
+internal: ${LOCAL_PROXY_IP} port = ${DANTE_PORT}
 external: ${ext_if}
 
 user.privileged: root
@@ -560,52 +656,42 @@ user.unprivileged: nobody
 socksmethod: none
 clientmethod: none
 
-# Allow local traffic to the proxy
 client pass {
     from: 127.0.0.0/8 to: 0.0.0.0/0
     log: connect error
 }
 
-# --- THE CIDR REALITY ---
-socks pass {
-    from: 127.0.0.1/32 to: 5.161.0.0/16 port = 443
-    command: connect
-    log: connect error
-}
-socks pass {
-    from: 127.0.0.1/32 to: 76.76.21.0/24 port = 443
-    command: connect
-    log: connect error
-}
-socks pass {
-    from: 127.0.0.1/32 to: 5.161.0.0/16 port = ${BTCLI_WSS_PORT}
-    command: connect
-    log: connect error
-}
-socks pass {
-    from: 127.0.0.1/32 to: 185.199.108.0/22 port = 443
-    command: connect
-    log: connect error
-}
-socks pass {
-    from: 127.0.0.1/32 to: 65.109.0.0/16 port = 443
-    command: connect
-    log: connect error
-}
-socks pass {
-    from: 127.0.0.1/32 to: 65.109.0.0/16 port = ${BTCLI_WSS_PORT}
-    command: connect
-    log: connect error
-}
+# Runtime Bittensor destinations.
+EOF
 
-${pypi_rule}
+  for rule in "${DANTE_RUNTIME_RULES[@]}"; do
+    destination="${rule%:*}"
+    port="${rule##*:}"
+    append_dante_pass_rule "$destination" "$port" "$tmpfile"
+  done
 
-# Catch-all block using "socks block"
+  if [[ "$allow_pypi" == "1" ]]; then
+    cat >> "$tmpfile" <<'EOF'
+
+# Temporary PyPI destinations resolved immediately before this policy was applied.
+EOF
+    for pypi_ip in "${pypi_ips[@]}"; do
+      append_dante_pass_rule "${pypi_ip}/32" "443" "$tmpfile"
+    done
+  fi
+
+  cat >> "$tmpfile" <<'EOF'
+
 socks block {
     from: 0.0.0.0/0 to: 0.0.0.0/0
     log: connect error
 }
 EOF
+
+  chown root:root "$tmpfile"
+  chmod 0600 "$tmpfile"
+  /usr/sbin/sockd -V -f "$tmpfile"
+  mv -f "$tmpfile" /etc/sockd.conf
   systemctl restart sockd
 }
 
@@ -674,6 +760,9 @@ unset \
   all_proxy
 
 export SOCKS_CONF='/etc/socks.conf'
+
+/usr/bin/logger -t tensorcage-btc -- \
+  "uid=$(id -u) pid=$$ invoked unified btcli" 2>/dev/null || true
 
 exec /usr/bin/socksify \
   /opt/tensorcage/venv/bin/btcli \
@@ -796,8 +885,10 @@ apply_policy() {
   local allow_os="${2:-0}"
 
   log "Applying policy (allow_pypi=${allow_pypi}, allow_os=${allow_os})"
-  render_dante_conf "$allow_pypi" "$allow_os"
+  # Open DNS first so temporary destinations can be resolved, then narrow Dante
+  # to the exact addresses returned. Closing follows the same fail-closed path.
   render_unbound_allowlist "$allow_pypi" "$allow_os"
+  render_dante_conf "$allow_pypi" "$allow_os"
 }
 
 
@@ -843,18 +934,36 @@ verify_chrony_sync() {
   log "Waiting for Chrony synchronization"
 
   chronyc online >/dev/null 2>&1 || true
+  chronyc makestep 0.1 1 >/dev/null 2>&1 || true
   chronyc burst 4/4 >/dev/null 2>&1 || true
 
-  local attempt
-  local selected='0'
-  for attempt in $(seq 1 30); do
-    if LC_ALL=C chronyc sources 2>/dev/null | grep -q '^[#^][*]'; then
-      selected='1'
-    fi
+  # Wait for a selected source and for the remaining correction reported by
+  # tracking to be below the configured threshold. waitsync is the native
+  # chrony primitive for this purpose.
+  if ! chronyc waitsync 30 "$CHRONY_MAX_CORRECTION_SECONDS" 0 2 >/dev/null 2>&1; then
+    echo "Chrony did not reach the required synchronization threshold."
+    echo
+    chronyc tracking 2>/dev/null || true
+    echo
+    chronyc -n sources -v 2>/dev/null || true
+    return 1
+  fi
 
-    if [[ "$selected" == '1' ]] && \
-       LC_ALL=C chronyc tracking 2>/dev/null | grep -q 'Leap status[[:space:]]*:[[:space:]]*Normal'; then
-      chronyc makestep >/dev/null 2>&1 || true
+  chronyc makestep >/dev/null 2>&1 || true
+
+  local attempt
+  local tracking
+  local last_offset
+  for attempt in $(seq 1 30); do
+    tracking="$(LC_ALL=C chronyc tracking 2>/dev/null || true)"
+    last_offset="$(printf '%s
+' "$tracking" | awk -F: '/^Last offset/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}')"
+
+    if LC_ALL=C chronyc sources 2>/dev/null | grep -q '^[#^][*]' && \
+       printf '%s
+' "$tracking" | grep -q 'Leap status[[:space:]]*:[[:space:]]*Normal' && \
+       [[ -n "$last_offset" ]] && \
+       awk -v value="$last_offset" 'BEGIN { if (value < 0) value = -value; exit !(value < 1.0) }'; then
       log "Chrony synchronized successfully"
       return 0
     fi
@@ -862,7 +971,7 @@ verify_chrony_sync() {
     sleep 2
   done
 
-  echo "Chrony could not synchronize with the configured pinned NTP servers."
+  echo "Chrony selected a source, but its post-step offset did not stabilize below 1 second."
   echo
   chronyc tracking 2>/dev/null || true
   echo
@@ -895,28 +1004,39 @@ EOF
 configure_nft_containment_service() {
   log "Configuring persistent nftables containment service"
 
-  cat > /usr/local/sbin/tensorcage-nft-apply <<'EOF'
+  local target_user
+  local target_uid
+  target_user="$(get_target_user)"
+  target_uid="$(id -u "$target_user")"
+
+  cat > /usr/local/sbin/tensorcage-nft-apply <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
 cat > /run/tensorcage.nft <<'NFT'
 table inet tensorcage {
   chain output {
-    type filter hook output priority 0; policy accept;
+    type filter hook output priority -50; policy accept;
 
     ct state established,related accept
+
+    # Only root and the designated TensorCage operator may use the local
+    # SOCKS listener. Other local users are denied before the generic
+    # loopback allowance.
+    ip daddr 127.0.0.1 tcp dport 1080 meta skuid { 0, ${target_uid} } accept
+    ip daddr 127.0.0.1 tcp dport 1080 log prefix "TC_DENY_SOCKS_LOCAL: " drop
+
     oif "lo" accept
 
     ip daddr 127.0.0.1 udp dport 53 accept
     ip daddr 127.0.0.1 tcp dport 53 accept
-    ip daddr 127.0.0.1 tcp dport 1080 accept
 
     meta skuid unbound ip daddr { 1.1.1.1, 8.8.8.8 } udp dport 53 accept
     meta skuid unbound ip daddr { 1.1.1.1, 8.8.8.8 } tcp dport 53 accept
     meta skuid nobody tcp dport { 80, 443, 9944 } accept
 
-    # btcli runtime: direct user-scoped egress for asyncio/websocket compatibility
-    meta skuid Berzeck ip daddr 5.161.0.0/16 tcp dport { 443, 9944 } accept
+    # No direct user egress exception: btcli must traverse Dante so the
+    # destination allowlist and logging cannot be bypassed.
 
     meta skuid root udp sport 68 udp dport 67 accept
     udp sport 67 udp dport 68 accept
@@ -1150,6 +1270,31 @@ EOF
   echo
   echo "TensorCage install completed successfully."
   echo "Machine secured."
+}
+
+sync_runtime_policy() {
+  require_baseline_install
+
+  log "Reapplying closed TensorCage runtime policy"
+  render_dante_client_conf
+  install_btc_wrapper
+  apply_policy 0 0
+  configure_nft_containment_service
+
+  systemctl is-active --quiet sockd || {
+    echo "sockd is not active after policy synchronization."
+    return 1
+  }
+  systemctl is-active --quiet unbound || {
+    echo "unbound is not active after policy synchronization."
+    return 1
+  }
+  systemctl is-active --quiet tensorcage-nft.service || {
+    echo "tensorcage-nft.service is not active after policy synchronization."
+    return 1
+  }
+
+  log "Closed runtime policy synchronized successfully"
 }
 
 ########################################
@@ -1977,32 +2122,86 @@ show_info() {
   if ! systemctl is-active --quiet sockd; then
     echo "Dante (sockd) is not currently active."
   else
-    echo "Analyzing live Dante journal logs..."
+    echo "Dante logs destination decisions, but do not provide the originating PID."
+    echo "Recent btc-wrapper invocations are shown separately for time correlation."
     echo
 
-    echo "Top PERMITTED Destinations (The Allowlist):"
+    echo "Top PERMITTED remote destinations:"
     echo "-----------------------------------------"
-    journalctl -u sockd --since "1 day ago" --no-pager 2>/dev/null | \
-      grep "pass.*tcp/connect" | \
-      awk -F '-> ' 'NF > 1 {print $2}' | \
-      awk '{print $NF}' | \
-      sed -E 's/\.([0-9]+)$//' | \
-      sort | uniq -c | sort -nr | head -n 15 || echo "No permitted traffic logged yet."
+    permitted="$({
+      journalctl -u sockd --since "1 day ago" --no-pager 2>/dev/null |
+        grep "pass.*tcp/connect" |
+        awk -F '-> ' 'NF > 1 {print $2}' |
+        awk '{print $NF}' |
+        sed -E 's/\.([0-9]+)$//' |
+        sort | uniq -c | sort -nr | head -n 15
+    } || true)"
+    if [[ -n "$permitted" ]]; then
+      printf '%s\n' "$permitted"
+    else
+      echo "No permitted remote traffic logged."
+    fi
 
     echo
-    echo "Top BLOCKED Destinations (The Cage working):"
+    echo "Blocked hostname resolutions (DNS allowlist):"
     echo "-----------------------------------------"
-    journalctl -u sockd --since "1 day ago" --no-pager 2>/dev/null | \
-      grep "block.*tcp/connect" | \
-      awk -F '-> ' 'NF > 1 {print $2}' | \
-      awk '{print $NF}' | \
-      sed -E 's/\.([0-9]+)$//' | \
-      sort | uniq -c | sort -nr | head -n 15 || echo "No blocked traffic logged yet."
+    blocked_hosts="$({
+      journalctl -u sockd --since "1 day ago" --no-pager 2>/dev/null |
+        sed -n 's/.*could not resolve hostname "\([^"]*\)".*/\1/p' |
+        sort | uniq -c | sort -nr | head -n 15
+    } || true)"
+    if [[ -n "$blocked_hosts" ]]; then
+      printf '%s\n' "$blocked_hosts"
+    else
+      echo "No blocked hostname resolutions logged."
+    fi
 
     echo
-    echo "Most Recent Activity:"
+    echo "Blocked Dante destination requests:"
     echo "-----------------------------------------"
-    journalctl -u sockd -n 10 --no-pager 2>/dev/null | \
+    blocked_destinations="$({
+      journalctl -u sockd --since "1 day ago" --no-pager 2>/dev/null |
+        grep "block.*tcp/connect" |
+        sed -n -E 's/.*to ([^ ]+):.*/\1/p' |
+        sort | uniq -c | sort -nr | head -n 15
+    } || true)"
+    if [[ -n "$blocked_destinations" ]]; then
+      printf '%s\n' "$blocked_destinations"
+    else
+      echo "No blocked destination requests logged."
+    fi
+
+    echo
+    echo "Unauthorized local SOCKS access attempts:"
+    echo "-----------------------------------------"
+    unauthorized_local="$({
+      journalctl -k --since "1 day ago" --no-pager 2>/dev/null |
+        grep 'TC_DENY_SOCKS_LOCAL:' |
+        tail -n 15
+    } || true)"
+    if [[ -n "$unauthorized_local" ]]; then
+      printf '%s\n' "$unauthorized_local"
+    else
+      echo "No unauthorized local SOCKS access logged."
+    fi
+
+    echo
+    echo "Recent btc wrapper invocations:"
+    echo "-----------------------------------------"
+    wrapper_activity="$({
+      journalctl -t tensorcage-btc --since "1 day ago" --no-pager 2>/dev/null |
+        tail -n 15
+    } || true)"
+    if [[ -n "$wrapper_activity" ]]; then
+      printf '%s\n' "$wrapper_activity"
+    else
+      echo "No btc wrapper invocations logged."
+    fi
+
+    echo
+    echo "Most Recent Dante Activity:"
+    echo "-----------------------------------------"
+    journalctl -u sockd -n 10 --no-pager 2>/dev/null |
       awk '{for(i=6;i<=NF;i++) printf $i" "; print ""}' || true
   fi
   echo
@@ -2048,6 +2247,9 @@ case "$COMMAND" in
     ;;
   time-sync)
     configure_chrony
+    ;;
+  policy-sync)
+    sync_runtime_policy
     ;;
   os-update)
     os_update
