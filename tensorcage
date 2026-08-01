@@ -1602,7 +1602,13 @@ create_bittensor_lock() {
   local target_home=""
   local target_group=""
   local secured_mode='0'
-  local policy_opened='0'
+
+  # EXIT traps run after function-local scope may have been unwound.
+  # Cleanup state must therefore remain globally reachable until the trap
+  # is explicitly removed.
+  TC_LOCK_CREATE_POLICY_OPENED='0'
+  TC_LOCK_CREATE_TMPDIR=''
+  TC_LOCK_CREATE_TEMP_LOCK=''
 
   # Two supported lock-creation modes:
   #   1. Normal user on an unrestricted trusted host: direct PyPI download.
@@ -1683,17 +1689,27 @@ create_bittensor_lock() {
   tmpdir="$(mktemp -d /tmp/tensorcage-lock-create.XXXXXX)"
   temp_lock="$(mktemp "${output_dir}/.tensorcage-lock.XXXXXX")"
 
+  TC_LOCK_CREATE_TMPDIR="$tmpdir"
+  TC_LOCK_CREATE_TEMP_LOCK="$temp_lock"
+
   cleanup_lock_create() {
     local cleanup_status='0'
 
-    if [[ "$policy_opened" == '1' ]]; then
+    if [[ "${TC_LOCK_CREATE_POLICY_OPENED:-0}" == '1' ]]; then
       log "Re-closing PyPI access after lock creation"
       apply_policy 0 0 || cleanup_status='1'
-      policy_opened='0'
+      TC_LOCK_CREATE_POLICY_OPENED='0'
     fi
 
-    rm -rf "$tmpdir"
-    rm -f "$temp_lock"
+    if [[ -n "${TC_LOCK_CREATE_TMPDIR:-}" ]]; then
+      rm -rf -- "$TC_LOCK_CREATE_TMPDIR"
+      TC_LOCK_CREATE_TMPDIR=''
+    fi
+
+    if [[ -n "${TC_LOCK_CREATE_TEMP_LOCK:-}" ]]; then
+      rm -f -- "$TC_LOCK_CREATE_TEMP_LOCK"
+      TC_LOCK_CREATE_TEMP_LOCK=''
+    fi
 
     if [[ "$cleanup_status" != '0' ]]; then
       echo "WARNING: Failed to fully restore the closed PyPI policy."
@@ -1714,7 +1730,7 @@ create_bittensor_lock() {
     log "Temporarily opening PyPI access for lock creation"
     # Mark the policy window before applying it so the EXIT trap attempts a
     # fail-closed restoration even if policy application fails partway.
-    policy_opened='1'
+    TC_LOCK_CREATE_POLICY_OPENED='1'
     apply_policy 1 0
 
     verify_socksified_python_egress "$target_user" "$target_home"
@@ -1835,14 +1851,21 @@ TENSORCAGE_CREATE_LOCK_PY
 
   # Close PyPI before reporting success. Keeping the EXIT trap active until
   # this succeeds ensures failure remains fail-closed.
-  if [[ "$policy_opened" == '1' ]]; then
+  if [[ "${TC_LOCK_CREATE_POLICY_OPENED:-0}" == '1' ]]; then
     log "Re-closing PyPI access after lock creation"
     apply_policy 0 0
-    policy_opened='0'
+    TC_LOCK_CREATE_POLICY_OPENED='0'
   fi
 
   trap - EXIT
-  rm -rf "$tmpdir"
+  rm -rf -- "$tmpdir"
+
+  TC_LOCK_CREATE_TMPDIR=''
+  TC_LOCK_CREATE_TEMP_LOCK=''
+  unset \
+    TC_LOCK_CREATE_POLICY_OPENED \
+    TC_LOCK_CREATE_TMPDIR \
+    TC_LOCK_CREATE_TEMP_LOCK
 
   printf '\n%s\n' 'Lock manifest created successfully.'
   printf 'Path:   %s\n' "$output_abs"
