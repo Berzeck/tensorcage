@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.7.1"
+APP_VERSION="1.8.1"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -79,7 +79,8 @@ ${APP_NAME} ${APP_VERSION}
 
 Usage:
   ${CLI_NAME} install
-  ${CLI_NAME} update bittensor=<version> bittensor_hash=<sha256>
+  ${CLI_NAME} lock-create bittensor=<version> output=<path>
+  ${CLI_NAME} update bittensor=<version> lock=<path> lock_hash=<sha256>
   ${CLI_NAME} os-update
   ${CLI_NAME} os-upgrade
   ${CLI_NAME} uninstall
@@ -89,7 +90,10 @@ Usage:
 
 Commands:
   install   Apply baseline hardening and configure the host
-  update    Temporarily open PyPI, download Bittensor 11+, verify SHA256, and install
+  lock-create Download an exact Bittensor wheel set and create a hash-locked manifest.
+              On a secured TensorCage host, run with sudo: PyPI opens only for the
+              download window, traffic is routed through Dante, and PyPI is re-closed.
+  update    Temporarily open PyPI, verify every wheel against an approved manifest, and install
   os-update Temporarily open openSUSE mirrors, run zypper refresh/update, and re-close
   os-upgrade Temporarily open openSUSE mirrors, run zypper refresh/dup, and re-close
   uninstall Disable TensorCage controls for maintenance; install can reapply cleanly
@@ -106,9 +110,20 @@ Examples:
 
   sudo ${CLI_NAME} uninstall
 
+  # Unrestricted trusted host:
+  ${CLI_NAME} lock-create \
+    bittensor=11.0.1 \
+    output=./bittensor-11.0.1-cp313-linux-x86_64.lock
+
+  # Trusted host already protected by TensorCage:
+  sudo ${CLI_NAME} lock-create \
+    bittensor=11.0.1 \
+    output=./bittensor-11.0.1-cp313-linux-x86_64.lock
+
   sudo ${CLI_NAME} update \
-    bittensor=11.0.0 \
-    bittensor_hash=<sha256>
+    bittensor=11.0.1 \
+    lock=./bittensor-11.0.1-cp313-linux-x86_64.lock \
+    lock_hash=<sha256-of-lock-file>
 EOF
 }
 
@@ -128,7 +143,9 @@ if [[ $# -gt 0 ]]; then
 fi
 
 BITTENSOR_VERSION=""
-BITTENSOR_HASH=""
+LOCK_FILE=""
+LOCK_HASH=""
+LOCK_OUTPUT=""
 
 case "${COMMAND}" in
   install)
@@ -139,11 +156,30 @@ case "${COMMAND}" in
       exit 1
     fi
     ;;
+  lock-create)
+    for arg in "$@"; do
+      case "$arg" in
+        bittensor=*) BITTENSOR_VERSION="${arg#bittensor=}" ;;
+        output=*) LOCK_OUTPUT="${arg#output=}" ;;
+        *)
+          echo "Unknown lock-create argument: $arg"
+          echo
+          usage
+          exit 1
+          ;;
+      esac
+    done
+
+    [[ -n "$BITTENSOR_VERSION" ]] || { echo "Missing required arg: bittensor=<version>"; exit 1; }
+    [[ -n "$LOCK_OUTPUT" ]] || { echo "Missing required arg: output=<path>"; exit 1; }
+    validate_version "$BITTENSOR_VERSION" || { echo "Invalid bittensor version: $BITTENSOR_VERSION"; exit 1; }
+    ;;
   update)
     for arg in "$@"; do
       case "$arg" in
         bittensor=*) BITTENSOR_VERSION="${arg#bittensor=}" ;;
-        bittensor_hash=*) BITTENSOR_HASH="${arg#bittensor_hash=}" ;;
+        lock=*) LOCK_FILE="${arg#lock=}" ;;
+        lock_hash=*) LOCK_HASH="${arg#lock_hash=}" ;;
         *)
           echo "Unknown update argument: $arg"
           echo
@@ -154,9 +190,10 @@ case "${COMMAND}" in
     done
 
     [[ -n "$BITTENSOR_VERSION" ]] || { echo "Missing required arg: bittensor=<version>"; exit 1; }
-    [[ -n "$BITTENSOR_HASH" ]] || { echo "Missing required arg: bittensor_hash=<sha256>"; exit 1; }
+    [[ -n "$LOCK_FILE" ]] || { echo "Missing required arg: lock=<path>"; exit 1; }
+    [[ -n "$LOCK_HASH" ]] || { echo "Missing required arg: lock_hash=<sha256>"; exit 1; }
     validate_version "$BITTENSOR_VERSION" || { echo "Invalid bittensor version: $BITTENSOR_VERSION"; exit 1; }
-    validate_sha256 "$BITTENSOR_HASH" || { echo "Invalid bittensor SHA256: $BITTENSOR_HASH"; exit 1; }
+    validate_sha256 "$LOCK_HASH" || { echo "Invalid lock-file SHA256: $LOCK_HASH"; exit 1; }
     ;;
   os-update)
     if [[ $# -ne 0 ]]; then
@@ -450,25 +487,32 @@ configure_repos() {
 # Preconditions
 ########################################
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Run this script as root (preferably via sudo from your normal user)."
-  exit 1
+if [[ "$COMMAND" == "lock-create" ]]; then
+  require_command python3
+  require_command sha256sum
+  require_command mktemp
+  require_command find
+else
+  if [[ $EUID -ne 0 ]]; then
+    echo "Run this command as root (preferably via sudo from your normal user)."
+    exit 1
+  fi
+
+  require_command firewall-cmd
+  require_command getent
+  require_command "$PYTHON_BIN"
+  require_command zypper
+  require_command systemctl
+  require_command runuser
+  require_command sha256sum
+  require_command mktemp
+  require_command find
+  require_command hostname
+  require_command chown
+  require_command chmod
+
+  detect_opensuse_leap
 fi
-
-require_command firewall-cmd
-require_command getent
-require_command "$PYTHON_BIN"
-require_command zypper
-require_command systemctl
-require_command runuser
-require_command sha256sum
-require_command mktemp
-require_command find
-require_command hostname
-require_command chown
-require_command chmod
-
-detect_opensuse_leap
 
 ########################################
 # Render functions
@@ -591,6 +635,42 @@ EOF
   chown root:root "$tmpfile"
   chmod 0644 "$tmpfile"
   mv -f "$tmpfile" /etc/socks.conf
+}
+
+install_btc_wrapper() {
+  log "Installing unified btcli wrapper"
+
+  if [[ -L /usr/local/bin/btc ]]; then
+    echo "Refusing to replace symbolic link: /usr/local/bin/btc"
+    exit 1
+  fi
+
+  backup_file /usr/local/bin/btc
+
+  local tmpfile
+  tmpfile="$(mktemp /usr/local/bin/btc.tensorcage.XXXXXX)"
+
+  cat > "$tmpfile" <<'EOF'
+#!/usr/bin/env bash
+
+unset \
+  http_proxy \
+  https_proxy \
+  HTTP_PROXY \
+  HTTPS_PROXY \
+  ALL_PROXY \
+  all_proxy
+
+export SOCKS_CONF='/etc/socks.conf'
+
+exec /usr/bin/socksify \
+  /opt/tensorcage/venv/bin/btcli \
+  "$@"
+EOF
+
+  chown root:root "$tmpfile"
+  chmod 0755 "$tmpfile"
+  mv -f "$tmpfile" /usr/local/bin/btc
 }
 
 verify_socksified_python_egress() {
@@ -972,13 +1052,7 @@ EOF
 
   render_dante_client_conf
 
-  log "Installing btcli wrapper"
-  cat > /usr/local/bin/btc <<'EOF'
-#!/usr/bin/env bash
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-exec /opt/tensorcage/venv/bin/btcli "$@"
-EOF
-  chmod +x /usr/local/bin/btc
+  install_btc_wrapper
 
   log "Machine secured successfully."
   echo
@@ -1051,18 +1125,445 @@ uninstall_tensorcage() {
 }
 
 ########################################
+# Hash-locked Bittensor manifests
+########################################
+
+create_bittensor_lock() {
+  local bittensor_version="$1"
+  local output_path="$2"
+  local tmpdir=""
+  local output_dir=""
+  local output_abs=""
+  local temp_lock=""
+  local lock_python=""
+  local target_user=""
+  local target_home=""
+  local target_group=""
+  local secured_mode='0'
+  local policy_opened='0'
+
+  # Two supported lock-creation modes:
+  #   1. Normal user on an unrestricted trusted host: direct PyPI download.
+  #   2. Root (normally via sudo) on an installed TensorCage host: temporary
+  #      PyPI allowlist, Dante-only egress, then automatic re-closure.
+  if [[ $EUID -eq 0 ]] \
+    && [[ -f /etc/sockd.conf && ! -L /etc/sockd.conf ]] \
+    && [[ -f /etc/unbound/unbound.conf && ! -L /etc/unbound/unbound.conf ]] \
+    && [[ -x /usr/sbin/sockd ]] \
+    && [[ -x /usr/sbin/unbound-checkconf ]] \
+    && [[ -x /usr/bin/socksify ]]; then
+    secured_mode='1'
+  fi
+
+  if [[ "$secured_mode" == '1' ]]; then
+    require_baseline_install
+    require_command runuser
+    require_command chown
+    require_command chmod
+    require_command systemctl
+
+    lock_python="$PYTHON_BIN"
+    [[ -x "$lock_python" ]] || {
+      echo "TensorCage Python is missing or not executable: $lock_python"
+      exit 1
+    }
+
+    target_user="$(get_target_user)"
+    if [[ "$target_user" == 'root' ]]; then
+      echo "Refusing to create a trusted-user lock as root without an explicit owner."
+      echo "Run with sudo from a normal user, or set TENSORCAGE_USER=<username>."
+      exit 1
+    fi
+    id "$target_user" >/dev/null 2>&1 || {
+      echo "Target user does not exist: $target_user"
+      exit 1
+    }
+    target_home="$(get_target_home "$target_user")"
+    target_group="$(id -gn "$target_user")"
+  else
+    lock_python="$(command -v python3 || true)"
+    [[ -n "$lock_python" && -x "$lock_python" ]] || {
+      echo "python3 is required to create a lock manifest."
+      exit 1
+    }
+    target_user="$(id -un)"
+    target_home="$HOME"
+    target_group="$(id -gn)"
+  fi
+
+  if ! "$lock_python" -m pip --version >/dev/null 2>&1; then
+    echo "pip is required for the selected Python interpreter: $lock_python"
+    exit 1
+  fi
+
+  if [[ -L "$output_path" ]]; then
+    echo "Refusing to replace symbolic link: $output_path"
+    exit 1
+  fi
+
+  output_dir="$(dirname -- "$output_path")"
+  [[ -d "$output_dir" ]] || {
+    echo "Output directory does not exist: $output_dir"
+    exit 1
+  }
+
+  output_abs="$(cd "$output_dir" && pwd -P)/$(basename -- "$output_path")"
+
+  if [[ -e "$output_abs" && ! -f "$output_abs" ]]; then
+    echo "Refusing to replace non-regular output path: $output_abs"
+    exit 1
+  fi
+  if [[ -L "$output_abs" ]]; then
+    echo "Refusing to replace symbolic link: $output_abs"
+    exit 1
+  fi
+
+  tmpdir="$(mktemp -d /tmp/tensorcage-lock-create.XXXXXX)"
+  temp_lock="$(mktemp "${output_dir}/.tensorcage-lock.XXXXXX")"
+
+  cleanup_lock_create() {
+    local cleanup_status='0'
+
+    if [[ "$policy_opened" == '1' ]]; then
+      log "Re-closing PyPI access after lock creation"
+      apply_policy 0 0 || cleanup_status='1'
+      policy_opened='0'
+    fi
+
+    rm -rf "$tmpdir"
+    rm -f "$temp_lock"
+
+    if [[ "$cleanup_status" != '0' ]]; then
+      echo "WARNING: Failed to fully restore the closed PyPI policy."
+      return 1
+    fi
+  }
+  trap cleanup_lock_create EXIT
+
+  if [[ "$secured_mode" == '1' ]]; then
+    log "Lock-create mode: secured TensorCage host"
+    log "Target user for lock creation: ${target_user}"
+
+    chown "$target_user:$target_group" "$tmpdir"
+    chmod 0700 "$tmpdir"
+
+    render_dante_client_conf
+
+    log "Temporarily opening PyPI access for lock creation"
+    # Mark the policy window before applying it so the EXIT trap attempts a
+    # fail-closed restoration even if policy application fails partway.
+    policy_opened='1'
+    apply_policy 1 0
+
+    verify_socksified_python_egress "$target_user" "$target_home"
+
+    log "Downloading the exact Bittensor ${bittensor_version} wheel set through Dante"
+    runuser -u "$target_user" -- env \
+      HOME="$target_home" \
+      PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
+      SOCKS_CONF='/etc/socks.conf' \
+      PIP_DISABLE_PIP_VERSION_CHECK=1 \
+      /usr/bin/socksify "$lock_python" -m pip download \
+        --disable-pip-version-check \
+        --only-binary=:all: \
+        --dest "$tmpdir" \
+        "bittensor==${bittensor_version}"
+  else
+    log "Lock-create mode: unrestricted trusted host"
+    log "Downloading the exact Bittensor ${bittensor_version} wheel set"
+    "$lock_python" -m pip download \
+      --disable-pip-version-check \
+      --only-binary=:all: \
+      --dest "$tmpdir" \
+      "bittensor==${bittensor_version}"
+  fi
+
+  log "Generating a complete SHA256 lock manifest"
+  TENSORCAGE_LOCK_VERSION='1' \
+  TENSORCAGE_BITTENSOR_VERSION="$bittensor_version" \
+  TENSORCAGE_WHEEL_DIR="$tmpdir" \
+  TENSORCAGE_LOCK_OUTPUT="$temp_lock" \
+    "$lock_python" - <<'TENSORCAGE_CREATE_LOCK_PY'
+import email
+import hashlib
+import os
+import platform
+import re
+import sys
+import zipfile
+from pathlib import Path
+
+wheel_dir = Path(os.environ["TENSORCAGE_WHEEL_DIR"])
+output = Path(os.environ["TENSORCAGE_LOCK_OUTPUT"])
+expected_bittensor = os.environ["TENSORCAGE_BITTENSOR_VERSION"]
+lock_version = os.environ["TENSORCAGE_LOCK_VERSION"]
+
+
+def canonicalize(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+records: dict[str, tuple[str, str, str]] = {}
+wheel_files = sorted(wheel_dir.glob("*.whl"))
+if not wheel_files:
+    raise SystemExit("No wheel files were downloaded")
+
+for wheel in wheel_files:
+    if wheel.is_symlink() or not wheel.is_file():
+        raise SystemExit(f"Unsafe wheel entry: {wheel}")
+
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_names = [
+            name for name in archive.namelist()
+            if name.endswith(".dist-info/METADATA")
+        ]
+        if len(metadata_names) != 1:
+            raise SystemExit(f"Expected one METADATA file in {wheel.name}")
+        message = email.message_from_bytes(archive.read(metadata_names[0]))
+
+    raw_name = message.get("Name")
+    version = message.get("Version")
+    if not raw_name or not version:
+        raise SystemExit(f"Missing Name or Version metadata in {wheel.name}")
+
+    name = canonicalize(raw_name)
+    if name in records:
+        raise SystemExit(f"Duplicate distribution in wheel set: {name}")
+
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    records[name] = (version, digest, wheel.name)
+
+if "bittensor" not in records:
+    raise SystemExit("The wheel set does not contain bittensor")
+if records["bittensor"][0] != expected_bittensor:
+    raise SystemExit(
+        f"Downloaded Bittensor version mismatch: "
+        f"expected {expected_bittensor}, got {records['bittensor'][0]}"
+    )
+
+python_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+platform_tag = f"{sys.platform}-{platform.machine().lower()}"
+
+lines = [
+    "# TensorCage complete wheel lock",
+    f"# tensorcage-lock-version: {lock_version}",
+    f"# bittensor-version: {expected_bittensor}",
+    f"# python-tag: {python_tag}",
+    f"# platform: {platform_tag}",
+    "# Every non-comment line is an exact requirement with its approved wheel hash.",
+]
+for name in sorted(records):
+    version, digest, filename = records[name]
+    lines.append(f"# wheel: {filename}")
+    lines.append(f"{name}=={version} --hash=sha256:{digest}")
+
+output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+TENSORCAGE_CREATE_LOCK_PY
+
+  chmod 0644 "$temp_lock"
+  mv -f "$temp_lock" "$output_abs"
+
+  if [[ "$secured_mode" == '1' ]]; then
+    chown "$target_user:$target_group" "$output_abs"
+  fi
+
+  # Close PyPI before reporting success. Keeping the EXIT trap active until
+  # this succeeds ensures failure remains fail-closed.
+  if [[ "$policy_opened" == '1' ]]; then
+    log "Re-closing PyPI access after lock creation"
+    apply_policy 0 0
+    policy_opened='0'
+  fi
+
+  trap - EXIT
+  rm -rf "$tmpdir"
+
+  printf '\n%s\n' 'Lock manifest created successfully.'
+  printf 'Path:   %s\n' "$output_abs"
+  printf 'SHA256: %s\n' "$(sha256_file "$output_abs")"
+  printf 'Mode:   %s\n' "$([[ "$secured_mode" == '1' ]] && printf 'secured-through-Dante' || printf 'trusted-host-direct')"
+  printf '\nUse that single manifest hash when updating the secured machine.\n'
+}
+
+validate_bittensor_lock() {
+  local lock_file="$1"
+  local expected_lock_hash="$2"
+  local expected_bittensor_version="$3"
+  local actual_lock_hash=""
+
+  [[ -f "$lock_file" && ! -L "$lock_file" ]] || {
+    echo "Lock manifest must be a regular non-symlink file: $lock_file"
+    exit 1
+  }
+
+  actual_lock_hash="$(sha256_file "$lock_file")"
+  [[ "$actual_lock_hash" == "$expected_lock_hash" ]] || {
+    echo "Lock manifest hash mismatch"
+    echo "Expected: $expected_lock_hash"
+    echo "Actual:   $actual_lock_hash"
+    exit 1
+  }
+
+  TENSORCAGE_LOCK_FILE="$lock_file" \
+  TENSORCAGE_BITTENSOR_VERSION="$expected_bittensor_version" \
+    "$PYTHON_BIN" - <<'TENSORCAGE_VALIDATE_LOCK_PY'
+import os
+import platform
+import re
+import sys
+from pathlib import Path
+
+path = Path(os.environ["TENSORCAGE_LOCK_FILE"])
+expected_bittensor = os.environ["TENSORCAGE_BITTENSOR_VERSION"]
+text = path.read_text(encoding="utf-8")
+
+headers: dict[str, str] = {}
+requirements: dict[str, tuple[str, str]] = {}
+pattern = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s]+) "
+    r"--hash=sha256:([0-9a-fA-F]{64})$"
+)
+
+for raw_line in text.splitlines():
+    line = raw_line.strip()
+    if not line:
+        continue
+    if line.startswith("#"):
+        header = line[1:].strip()
+        if ":" in header:
+            key, value = header.split(":", 1)
+            headers[key.strip()] = value.strip()
+        continue
+
+    match = pattern.fullmatch(line)
+    if not match:
+        raise SystemExit(f"Unsafe or unsupported lock entry: {raw_line}")
+    raw_name, version, digest = match.groups()
+    name = re.sub(r"[-_.]+", "-", raw_name).lower()
+    if name in requirements:
+        raise SystemExit(f"Duplicate locked distribution: {name}")
+    requirements[name] = (version, digest.lower())
+
+if headers.get("tensorcage-lock-version") != "1":
+    raise SystemExit("Unsupported or missing tensorcage-lock-version")
+if headers.get("bittensor-version") != expected_bittensor:
+    raise SystemExit("Lock manifest Bittensor version does not match the explicit version")
+
+expected_python_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+if headers.get("python-tag") != expected_python_tag:
+    raise SystemExit(
+        f"Lock Python tag mismatch: expected {expected_python_tag}, "
+        f"got {headers.get('python-tag')}"
+    )
+
+expected_platform = f"{sys.platform}-{platform.machine().lower()}"
+if headers.get("platform") != expected_platform:
+    raise SystemExit(
+        f"Lock platform mismatch: expected {expected_platform}, "
+        f"got {headers.get('platform')}"
+    )
+
+if "bittensor" not in requirements:
+    raise SystemExit("Lock manifest does not contain bittensor")
+if requirements["bittensor"][0] != expected_bittensor:
+    raise SystemExit("Locked Bittensor requirement has the wrong version")
+if len(requirements) < 2:
+    raise SystemExit("Lock manifest does not contain the dependency set")
+
+print(f"Validated lock manifest with {len(requirements)} distributions")
+TENSORCAGE_VALIDATE_LOCK_PY
+}
+
+verify_downloaded_wheel_set() {
+  local lock_file="$1"
+  local wheel_dir="$2"
+
+  TENSORCAGE_LOCK_FILE="$lock_file" \
+  TENSORCAGE_WHEEL_DIR="$wheel_dir" \
+    "$PYTHON_BIN" - <<'TENSORCAGE_VERIFY_WHEELS_PY'
+import email
+import hashlib
+import os
+import re
+import zipfile
+from pathlib import Path
+
+lock_file = Path(os.environ["TENSORCAGE_LOCK_FILE"])
+wheel_dir = Path(os.environ["TENSORCAGE_WHEEL_DIR"])
+pattern = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s]+) "
+    r"--hash=sha256:([0-9a-fA-F]{64})$"
+)
+
+
+def canonicalize(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+expected: dict[str, tuple[str, str]] = {}
+for raw_line in lock_file.read_text(encoding="utf-8").splitlines():
+    match = pattern.fullmatch(raw_line.strip())
+    if match:
+        raw_name, version, digest = match.groups()
+        expected[canonicalize(raw_name)] = (version, digest.lower())
+
+actual: dict[str, tuple[str, str]] = {}
+entries = list(wheel_dir.iterdir())
+for entry in entries:
+    if entry.is_symlink() or not entry.is_file() or entry.suffix != ".whl":
+        raise SystemExit(f"Unexpected or unsafe download entry: {entry.name}")
+
+    with zipfile.ZipFile(entry) as archive:
+        metadata_names = [
+            name for name in archive.namelist()
+            if name.endswith(".dist-info/METADATA")
+        ]
+        if len(metadata_names) != 1:
+            raise SystemExit(f"Expected one METADATA file in {entry.name}")
+        message = email.message_from_bytes(archive.read(metadata_names[0]))
+
+    raw_name = message.get("Name")
+    version = message.get("Version")
+    if not raw_name or not version:
+        raise SystemExit(f"Missing metadata in {entry.name}")
+    name = canonicalize(raw_name)
+    if name in actual:
+        raise SystemExit(f"Duplicate downloaded distribution: {name}")
+    digest = hashlib.sha256(entry.read_bytes()).hexdigest()
+    actual[name] = (version, digest)
+
+if set(actual) != set(expected):
+    missing = sorted(set(expected) - set(actual))
+    unexpected = sorted(set(actual) - set(expected))
+    raise SystemExit(
+        f"Downloaded wheel set differs from lock; "
+        f"missing={missing}, unexpected={unexpected}"
+    )
+
+for name, expected_value in expected.items():
+    if actual[name] != expected_value:
+        raise SystemExit(
+            f"Wheel mismatch for {name}: expected={expected_value}, actual={actual[name]}"
+        )
+
+print(f"Verified {len(actual)} locked wheels; no missing or unexpected artifacts")
+TENSORCAGE_VERIFY_WHEELS_PY
+}
+
+########################################
 # Update mode
 ########################################
 
 update_bittensor() {
   local bittensor_version="$1"
-  local bittensor_hash_expected="$2"
+  local supplied_lock_file="$2"
+  local lock_hash_expected="$3"
 
   local target_user
   local target_home
   local tmpdir=""
-  local bittensor_file=""
-  local bittensor_hash_actual=""
+  local lock_copy=""
+  local wheel_dir=""
 
   require_baseline_install
 
@@ -1072,10 +1573,10 @@ update_bittensor() {
   if [[ "$target_user" == "root" ]]; then
     echo "Refusing to install Bittensor as root."
     echo "Run with sudo from a normal user, or set TENSORCAGE_USER=<username>."
-    echo "Example:"
-    echo "  TENSORCAGE_USER=Berzeck sudo -E ${CLI_NAME} update bittensor=<version> bittensor_hash=<sha256>"
     exit 1
   fi
+
+  validate_bittensor_lock "$supplied_lock_file" "$lock_hash_expected" "$bittensor_version"
 
   cleanup() {
     log "Re-closing PyPI access"
@@ -1084,17 +1585,15 @@ update_bittensor() {
       rm -rf "${tmpdir:-}"
     fi
   }
-
   trap cleanup EXIT
 
   log "Target user for update: ${target_user}"
-
-  if ! id "$target_user" >/dev/null 2>&1; then
+  id "$target_user" >/dev/null 2>&1 || {
     echo "Target user does not exist: $target_user"
     exit 1
-  fi
+  }
 
-  log "Update mode: unified bittensor package (Bittensor 11+)"
+  log "Update mode: complete hash-locked unified Bittensor wheel set"
 
   log "Stopping common runtimes and network utilities before opening update window"
   pkill -u "$target_user" -f "python" 2>/dev/null || true
@@ -1104,46 +1603,36 @@ update_bittensor() {
   pkill -u "$target_user" -f "curl" 2>/dev/null || true
   pkill -u "$target_user" -f "wget" 2>/dev/null || true
 
-  # Self-heal legacy TensorCage installations that still have the
-  # distribution sample /etc/socks.conf or no client route at all.
   render_dante_client_conf
-
-  log "Temporarily opening PyPI access"
-  apply_policy 1 0
-
-  verify_socksified_python_egress "$target_user" "$target_home"
 
   tmpdir="$(mktemp -d /tmp/bittensor-update.XXXXXX)"
   chown "$target_user":"$(id -gn "$target_user")" "$tmpdir"
   chmod 0700 "$tmpdir"
+  lock_copy="${tmpdir}/requirements.lock"
+  wheel_dir="${tmpdir}/wheels"
+  mkdir -p "$wheel_dir"
+  chown "$target_user":"$(id -gn "$target_user")" "$wheel_dir"
+  chmod 0700 "$wheel_dir"
+  install -o root -g root -m 0644 "$supplied_lock_file" "$lock_copy"
 
-  log "Downloading exact Bittensor release and its dependency wheels"
+  log "Temporarily opening PyPI access"
+  apply_policy 1 0
+  verify_socksified_python_egress "$target_user" "$target_home"
+
+  log "Downloading the exact fully hash-locked wheel set"
   runuser -u "$target_user" -- env \
     HOME="$target_home" \
     PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
     SOCKS_CONF='/etc/socks.conf' \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     /usr/bin/socksify "$PYTHON_BIN" -m pip download \
+      --require-hashes \
       --only-binary=:all: \
-      --dest "$tmpdir" \
-      "bittensor==${bittensor_version}"
+      --dest "$wheel_dir" \
+      --requirement "$lock_copy"
 
-  bittensor_file="$(find "$tmpdir" -maxdepth 1 -type f -name 'bittensor-*.whl' | head -n1 || true)"
-
-  [[ -n "$bittensor_file" && -f "$bittensor_file" ]] || {
-    echo "Failed to locate the downloaded bittensor wheel in $tmpdir"
-    exit 1
-  }
-
-  bittensor_hash_actual="$(sha256_file "$bittensor_file")"
-
-  log "Verifying Bittensor wheel hash"
-  [[ "$bittensor_hash_actual" == "$bittensor_hash_expected" ]] || {
-    echo "Bittensor hash mismatch"
-    echo "Expected: $bittensor_hash_expected"
-    echo "Actual:   $bittensor_hash_actual"
-    exit 1
-  }
+  log "Verifying exact wheel membership and every SHA256"
+  verify_downloaded_wheel_set "$lock_copy" "$wheel_dir"
 
   log "Removing superseded standalone CLI and wallet packages"
   env \
@@ -1154,15 +1643,16 @@ update_bittensor() {
       bittensor-cli \
       bittensor-wallet || true
 
-  log "Installing Bittensor from the locally downloaded wheel set"
+  log "Installing only the verified local wheel set"
   env \
     HOME="$target_home" \
     PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     "$PYTHON_BIN" -m pip install \
       --no-index \
-      --find-links "$tmpdir" \
-      "bittensor==${bittensor_version}"
+      --find-links "$wheel_dir" \
+      --require-hashes \
+      --requirement "$lock_copy"
 
   log "Verifying the installed Bittensor version"
   BITTENSOR_EXPECTED_VERSION="$bittensor_version" \
@@ -1185,19 +1675,21 @@ for legacy in ("bittensor-cli", "bittensor-wallet"):
         raise SystemExit(f"Superseded package still installed: {legacy} {legacy_version}")
 TENSORCAGE_VERIFY_PY
 
-  if [[ -x "/opt/tensorcage/venv/bin/btcli" ]]; then
-    runuser -u "$target_user" -- env \
-      HOME="$target_home" \
-      PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
-      "/opt/tensorcage/venv/bin/btcli" --version
-  else
+  [[ -x "/opt/tensorcage/venv/bin/btcli" ]] || {
     echo "Bittensor installed, but /opt/tensorcage/venv/bin/btcli was not created."
     exit 1
-  fi
+  }
+
+  runuser -u "$target_user" -- env \
+    HOME="$target_home" \
+    PATH="/opt/tensorcage/venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    "/opt/tensorcage/venv/bin/btcli" --version
+
+  install_btc_wrapper
 
   trap - EXIT
   cleanup
-  log "Strict unified Bittensor update completed"
+  log "Complete hash-locked unified Bittensor update completed"
 }
 
 ########################################
@@ -1343,8 +1835,33 @@ show_info() {
   firewall-cmd --direct --get-all-rules 2>/dev/null || echo "Could not read firewalld direct rules"
   echo
 
-  echo "[Direct Firewall Drops (Kernel Level)]"
-  journalctl -k --since "1 hour ago" | grep "TC_DROP:" | awk -F 'TC_DROP:' '{print $2}' | tail -n 15 || echo "No direct firewall drops logged."
+  echo "[Direct Firewall Drops (excluding DNS, last hour)]"
+  if ! journalctl -k --since "1 hour ago" 2>/dev/null | \
+    grep "TC_DROP:" | \
+    grep -Ev 'DPT=53([[:space:]]|$)' | \
+    awk -F 'TC_DROP:' '{print $2}' | \
+    tail -n 15; then
+    echo "No non-DNS direct firewall drops logged."
+  fi
+  echo
+
+  echo "[Blocked direct DNS attempts (last hour)]"
+  if ! journalctl -k --since "1 hour ago" 2>/dev/null | \
+    grep "TC_DROP:" | \
+    grep -E 'DPT=53([[:space:]]|$)' | \
+    awk '
+      {
+        destination="unknown"
+        protocol="unknown"
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^DST=/) { destination=substr($i, 5) }
+          if ($i ~ /^PROTO=/) { protocol=substr($i, 7) }
+        }
+        print protocol, destination
+      }
+    ' | sort | uniq -c | sort -nr | head -n 15; then
+    echo "No blocked direct DNS attempts logged."
+  fi
   echo
 
   # --- DANTE LIVE TRAFFIC DASHBOARD ---
@@ -1359,9 +1876,9 @@ show_info() {
     echo "-----------------------------------------"
     journalctl -u sockd --since "1 day ago" --no-pager 2>/dev/null | \
       grep "pass.*tcp/connect" | \
-      awk -F '-> ' '{print $2}' | \
-      awk '{print $1}' | \
-      sed 's/\.[0-9]*$//' | \
+      awk -F '-> ' 'NF > 1 {print $2}' | \
+      awk '{print $NF}' | \
+      sed -E 's/\.([0-9]+)$//' | \
       sort | uniq -c | sort -nr | head -n 15 || echo "No permitted traffic logged yet."
 
     echo
@@ -1369,9 +1886,9 @@ show_info() {
     echo "-----------------------------------------"
     journalctl -u sockd --since "1 day ago" --no-pager 2>/dev/null | \
       grep "block.*tcp/connect" | \
-      awk -F '-> ' '{print $2}' | \
-      awk '{print $1}' | \
-      sed 's/\.[0-9]*$//' | \
+      awk -F '-> ' 'NF > 1 {print $2}' | \
+      awk '{print $NF}' | \
+      sed -E 's/\.([0-9]+)$//' | \
       sort | uniq -c | sort -nr | head -n 15 || echo "No blocked traffic logged yet."
 
     echo
@@ -1433,10 +1950,16 @@ case "$COMMAND" in
   info)
     show_info
     ;;
+  lock-create)
+    create_bittensor_lock \
+      "$BITTENSOR_VERSION" \
+      "$LOCK_OUTPUT"
+    ;;
   update)
     update_bittensor \
       "$BITTENSOR_VERSION" \
-      "$BITTENSOR_HASH"
+      "$LOCK_FILE" \
+      "$LOCK_HASH"
     ;;
   *)
     usage
