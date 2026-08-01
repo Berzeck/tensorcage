@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.9.1"
+APP_VERSION="2.0.1"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -48,9 +48,10 @@ PYTHON_BIN="${PYTHON_BIN:-/opt/tensorcage/venv/bin/python}"
 TENSORCAGE_STATE_DIR="/var/lib/tensorcage"
 INTEGRITY_MANIFEST="${TENSORCAGE_STATE_DIR}/managed-configs.v2.tsv"
 ROLLBACK_ROOT="${TENSORCAGE_STATE_DIR}/rollback"
+LIFECYCLE_STATE_FILE="${TENSORCAGE_STATE_DIR}/lifecycle.state"
 MANIFEST_FORMAT_VERSION="2"
-POLICY_VERSION="5"
-CONFIGURATION_VERSION="5"
+POLICY_VERSION="6"
+CONFIGURATION_VERSION="6"
 
 ########################################
 # Domain allowlists
@@ -108,78 +109,60 @@ ${APP_NAME} ${APP_VERSION}
 
 Usage:
   ${CLI_NAME} install
+  ${CLI_NAME} enable
+  ${CLI_NAME} disable [--dry-run]
+  ${CLI_NAME} status
   ${CLI_NAME} lock-create bittensor=<version> output=<path>
+  ${CLI_NAME} lock-verify bittensor=<version> lock=<path> lock_hash=<sha256>
   ${CLI_NAME} update bittensor=<version> lock=<path> lock_hash=<sha256>
-  ${CLI_NAME} time-sync
-  ${CLI_NAME} policy-sync
-  ${CLI_NAME} os-update
-  ${CLI_NAME} os-upgrade
-  ${CLI_NAME} uninstall [--dry-run]
-  ${CLI_NAME} diff
-  ${CLI_NAME} test <dns|proxy|firewall|chrony|python|integrity>
-  ${CLI_NAME} selftest
-  ${CLI_NAME} info
   ${CLI_NAME} doctor
+  ${CLI_NAME} info
+  ${CLI_NAME} uninstall [--dry-run]
   ${CLI_NAME} help
   ${CLI_NAME} version
 
-Commands:
-  install   Apply baseline hardening and configure the host
-  lock-create Download an exact Bittensor wheel set and create a hash-locked manifest.
-              On a secured TensorCage host, run with sudo: PyPI opens only for the
-              download window, traffic is routed through Dante, and PyPI is re-closed.
-  update    Temporarily open PyPI, verify every wheel against an approved manifest, and install
-  time-sync Manage Chrony with pinned NTP IPs and verify synchronization
-  policy-sync Reapply the closed runtime policy, Dante client, btc wrapper, and nft containment
-  os-update Temporarily open openSUSE mirrors, run zypper refresh/update, and re-close
-  os-upgrade Temporarily open openSUSE mirrors, run zypper refresh/dup, and re-close
-  uninstall Disable TensorCage controls for maintenance; --dry-run only shows the plan
-  diff      Report managed-file content and metadata drift
-  test      Run one focused read-only subsystem test
-  selftest  Run the complete read-only doctor suite
-  info      Show security, network policy, and runtime activity summary
-  doctor    Run deep, read-only validation of all managed security components
-  help      Show this help message
-  version   Show version information
+Lifecycle:
+  install     Fresh installation and immediate enablement
+  enable      Reapply all containment controls and validate the enabled state
+  disable     Enter maintenance mode while preserving TensorCage and Bittensor
+  status      Show installed, enabled, and health state without changing anything
+  uninstall   Remove TensorCage application/runtime state while preserving wallets
+
+Security and updates:
+  lock-create Create a complete hash-locked Bittensor dependency manifest
+  lock-verify Validate a lock manifest without downloading or installing anything
+  update      Install only the exact wheel set approved by a validated lock manifest
+  doctor      Run deep, read-only validation of all enabled security components
+  info        Show detailed runtime, policy, integrity, and activity information
 
 Examples:
   sudo ${CLI_NAME} install
-
-  sudo ${CLI_NAME} time-sync
-
-  sudo ${CLI_NAME} policy-sync
-
-  sudo ${CLI_NAME} os-update
-
-  sudo ${CLI_NAME} os-upgrade
-
+  sudo ${CLI_NAME} disable --dry-run
+  sudo ${CLI_NAME} disable
+  sudo ${CLI_NAME} enable
+  sudo ${CLI_NAME} status
+  sudo ${CLI_NAME} doctor
   sudo ${CLI_NAME} uninstall --dry-run
 
-  sudo ${CLI_NAME} diff
-
-  sudo ${CLI_NAME} test dns
-
-  sudo ${CLI_NAME} selftest
-
-  sudo ${CLI_NAME} doctor
-
-  # Unrestricted trusted host:
   ${CLI_NAME} lock-create \
     bittensor=11.0.1 \
     output=./bittensor-11.0.1-cp313-linux-x86_64.lock
 
-  # Trusted host already protected by TensorCage:
-  sudo ${CLI_NAME} lock-create \
+  sudo ${CLI_NAME} lock-verify \
     bittensor=11.0.1 \
-    output=./bittensor-11.0.1-cp313-linux-x86_64.lock
+    lock=./bittensor-11.0.1-cp313-linux-x86_64.lock \
+    lock_hash=<sha256-of-lock-file>
 
   sudo ${CLI_NAME} update \
     bittensor=11.0.1 \
     lock=./bittensor-11.0.1-cp313-linux-x86_64.lock \
     lock_hash=<sha256-of-lock-file>
+
+Operator maintenance commands from 1.x are intentionally hidden from the public
+CLI. Existing scripts may temporarily use the compatibility aliases prefixed
+with an underscore; they are unsupported implementation details.
 EOF
 }
-
 validate_version() {
   local v="$1"
   [[ "$v" =~ ^[0-9]+(\.[0-9]+){1,3}([A-Za-z0-9._-]+)?$ ]]
@@ -199,16 +182,26 @@ BITTENSOR_VERSION=""
 LOCK_FILE=""
 LOCK_HASH=""
 LOCK_OUTPUT=""
+DISABLE_DRY_RUN="0"
 UNINSTALL_DRY_RUN="0"
 TEST_TARGET=""
 
 case "${COMMAND}" in
-  install)
-    if [[ $# -ne 0 ]]; then
-      echo "install does not accept extra arguments"
-      echo
-      usage
-      exit 1
+  install|enable|status|doctor|info)
+    [[ $# -eq 0 ]] || { echo "${COMMAND} does not accept extra arguments"; usage; exit 1; }
+    ;;
+  disable)
+    [[ $# -le 1 ]] || { echo "disable accepts only optional --dry-run"; usage; exit 1; }
+    if [[ $# -eq 1 ]]; then
+      [[ "$1" == "--dry-run" ]] || { echo "Unknown disable argument: $1"; exit 1; }
+      DISABLE_DRY_RUN="1"
+    fi
+    ;;
+  uninstall)
+    [[ $# -le 1 ]] || { echo "uninstall accepts only optional --dry-run"; usage; exit 1; }
+    if [[ $# -eq 1 ]]; then
+      [[ "$1" == "--dry-run" ]] || { echo "Unknown uninstall argument: $1"; exit 1; }
+      UNINSTALL_DRY_RUN="1"
     fi
     ;;
   lock-create)
@@ -216,120 +209,37 @@ case "${COMMAND}" in
       case "$arg" in
         bittensor=*) BITTENSOR_VERSION="${arg#bittensor=}" ;;
         output=*) LOCK_OUTPUT="${arg#output=}" ;;
-        *)
-          echo "Unknown lock-create argument: $arg"
-          echo
-          usage
-          exit 1
-          ;;
+        *) echo "Unknown lock-create argument: $arg"; usage; exit 1 ;;
       esac
     done
-
     [[ -n "$BITTENSOR_VERSION" ]] || { echo "Missing required arg: bittensor=<version>"; exit 1; }
     [[ -n "$LOCK_OUTPUT" ]] || { echo "Missing required arg: output=<path>"; exit 1; }
     validate_version "$BITTENSOR_VERSION" || { echo "Invalid bittensor version: $BITTENSOR_VERSION"; exit 1; }
     ;;
-  update)
+  lock-verify|update)
     for arg in "$@"; do
       case "$arg" in
         bittensor=*) BITTENSOR_VERSION="${arg#bittensor=}" ;;
         lock=*) LOCK_FILE="${arg#lock=}" ;;
         lock_hash=*) LOCK_HASH="${arg#lock_hash=}" ;;
-        *)
-          echo "Unknown update argument: $arg"
-          echo
-          usage
-          exit 1
-          ;;
+        *) echo "Unknown ${COMMAND} argument: $arg"; usage; exit 1 ;;
       esac
     done
-
     [[ -n "$BITTENSOR_VERSION" ]] || { echo "Missing required arg: bittensor=<version>"; exit 1; }
     [[ -n "$LOCK_FILE" ]] || { echo "Missing required arg: lock=<path>"; exit 1; }
     [[ -n "$LOCK_HASH" ]] || { echo "Missing required arg: lock_hash=<sha256>"; exit 1; }
     validate_version "$BITTENSOR_VERSION" || { echo "Invalid bittensor version: $BITTENSOR_VERSION"; exit 1; }
     validate_sha256 "$LOCK_HASH" || { echo "Invalid lock-file SHA256: $LOCK_HASH"; exit 1; }
     ;;
-  time-sync)
-    if [[ $# -ne 0 ]]; then
-      echo "time-sync does not accept extra arguments"
-      echo
-      usage
-      exit 1
-    fi
+  _policy-sync|_time-sync|_os-update|_os-upgrade|_diff|_selftest)
+    [[ $# -eq 0 ]] || { echo "${COMMAND} does not accept extra arguments"; exit 1; }
     ;;
-  policy-sync)
-    if [[ $# -ne 0 ]]; then
-      echo "policy-sync does not accept extra arguments"
-      echo
-      usage
-      exit 1
-    fi
-    ;;
-  os-update)
-    if [[ $# -ne 0 ]]; then
-      echo "os-update does not accept extra arguments"
-      echo
-      usage
-      exit 1
-    fi
-    ;;
-  os-upgrade)
-    if [[ $# -ne 0 ]]; then
-      echo "os-upgrade does not accept extra arguments"
-      echo
-      usage
-      exit 1
-    fi
-    ;;
-  uninstall)
-    if [[ $# -gt 1 ]]; then
-      echo "uninstall accepts only optional --dry-run"
-      echo
-      usage
-      exit 1
-    fi
-    if [[ $# -eq 1 ]]; then
-      [[ "$1" == "--dry-run" ]] || { echo "Unknown uninstall argument: $1"; exit 1; }
-      UNINSTALL_DRY_RUN="1"
-    fi
-    ;;
-  diff|selftest)
-    if [[ $# -ne 0 ]]; then
-      echo "${COMMAND} does not accept extra arguments"
-      echo
-      usage
-      exit 1
-    fi
-    ;;
-  test)
-    [[ $# -eq 1 ]] || { echo "test requires one target"; usage; exit 1; }
+  _test)
+    [[ $# -eq 1 ]] || { echo "_test requires one target"; exit 1; }
     TEST_TARGET="$1"
-    case "$TEST_TARGET" in
-      dns|proxy|firewall|chrony|python|integrity) ;;
-      *) echo "Unknown test target: $TEST_TARGET"; usage; exit 1 ;;
-    esac
+    case "$TEST_TARGET" in dns|proxy|firewall|chrony|python|integrity) ;; *) exit 1 ;; esac
     ;;
-  info)
-    if [[ $# -ne 0 ]]; then
-      echo "info does not accept extra arguments"
-      echo
-      usage
-      exit 1
-    fi
-    ;;
-  doctor)
-    if [[ $# -ne 0 ]]; then
-      echo "doctor does not accept extra arguments"
-      echo
-      usage
-      exit 1
-    fi
-    ;;
-  help|-h|--help|"")
-    usage
-    exit 0
-    ;;
+  help|-h|--help|"") usage; exit 0 ;;
   version|-v|--version)
     cat <<EOF
 ${APP_NAME}
@@ -341,14 +251,8 @@ Python: ${PYTHON_BIN}
 EOF
     exit 0
     ;;
-  *)
-    echo "Unknown command: ${COMMAND}"
-    echo
-    usage
-    exit 1
-    ;;
+  *) echo "Unknown command: ${COMMAND}"; echo; usage; exit 1 ;;
 esac
-
 ########################################
 # Helpers
 ########################################
@@ -398,7 +302,7 @@ direct_rule_exists() {
 add_direct_rule_once() {
   local args=("$@")
   if ! direct_rule_exists "${args[@]}"; then
-    firewall-cmd --permanent --direct --add-rule "${args[@]}"
+    firewall-cmd --permanent --direct --add-rule "${args[@]}" >/dev/null
   fi
 }
 
@@ -1180,7 +1084,100 @@ close_root_nft_maintenance_gate() {
 # Baseline install/config mode
 ########################################
 
+set_lifecycle_state() {
+  local state="$1"
+  install -d -o root -g root -m 0700 "$TENSORCAGE_STATE_DIR"
+  printf '%s\n' "$state" > "$LIFECYCLE_STATE_FILE"
+  chown root:root "$LIFECYCLE_STATE_FILE"
+  chmod 0600 "$LIFECYCLE_STATE_FILE"
+}
+
+require_enabled_state() {
+  if ! systemctl is-active --quiet tensorcage-nft.service 2>/dev/null \
+    || ! systemctl is-active --quiet sockd 2>/dev/null \
+    || ! systemctl is-active --quiet unbound 2>/dev/null; then
+    echo "TensorCage is installed but not enabled."
+    echo "Run: sudo /usr/local/bin/tensorcage enable"
+    return 1
+  fi
+}
+
+configure_firewall_containment() {
+  log "Configuring firewall rules"
+  local DANTE_UID
+  local UNBOUND_UID
+  local ntp_ip
+  local dns_ip
+  local port
+
+  DANTE_UID="$(id -u nobody)"
+  UNBOUND_UID="$(id -u unbound)"
+
+  # Flush existing TensorCage rules so re-installing doesn't fail
+  firewall-cmd --permanent --direct --remove-rules ipv4 filter OUTPUT >/dev/null 2>&1 || true
+  firewall-cmd --permanent --direct --remove-rules ipv6 filter OUTPUT >/dev/null 2>&1 || true
+
+  firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
+
+  add_direct_rule_once ipv4 filter INPUT 0 -p tcp --dport 22 -j ACCEPT
+  add_direct_rule_once ipv6 filter INPUT 0 -p tcp --dport 22 -j ACCEPT
+
+  add_direct_rule_once ipv4 filter INPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  add_direct_rule_once ipv6 filter INPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  add_direct_rule_once ipv6 filter OUTPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+  add_direct_rule_once ipv4 filter INPUT 0 -i lo -j ACCEPT
+  add_direct_rule_once ipv6 filter INPUT 0 -i lo -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -o lo -j ACCEPT
+  add_direct_rule_once ipv6 filter OUTPUT 0 -o lo -j ACCEPT
+
+  add_direct_rule_once ipv4 filter OUTPUT 0 -d "${LOCAL_PROXY_IP}" -p tcp --dport "${DANTE_PORT}" -j ACCEPT
+
+  add_direct_rule_once ipv4 filter OUTPUT 0 -d "${DNS_LOCAL_IP}" -p udp --dport "${UNBOUND_PORT}" -j ACCEPT
+  add_direct_rule_once ipv4 filter OUTPUT 0 -d "${DNS_LOCAL_IP}" -p tcp --dport "${UNBOUND_PORT}" -j ACCEPT
+
+  for dns_ip in "${UPSTREAM_DNS_SERVERS[@]}"; do
+    add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p udp -d "${dns_ip}" --dport 53 -j ACCEPT
+    add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p tcp -d "${dns_ip}" --dport 53 -j ACCEPT
+  done
+
+  add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner root --sport 68 --dport 67 -j ACCEPT
+  add_direct_rule_once ipv4 filter INPUT 0 -p udp --sport 67 --dport 68 -j ACCEPT
+
+  for port in "${DANTE_EGRESS_PORTS[@]}"; do
+    add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${DANTE_UID}" -p tcp --dport "${port}" -j ACCEPT
+  done
+
+  for ntp_ip in "${NTP_IPS[@]}"; do
+    add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner root -d "${ntp_ip}" --dport 123 -j ACCEPT
+    if id chrony >/dev/null 2>&1; then
+      add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner chrony -d "${ntp_ip}" --dport 123 -j ACCEPT
+    fi
+  done
+  # Log unauthorized outbound attempts right before they hit the DROP rule
+  add_direct_rule_once ipv4 filter OUTPUT 99 -j LOG --log-prefix "TC_DROP: "
+  add_direct_rule_once ipv6 filter OUTPUT 99 -j LOG --log-prefix "TC_DROP: "
+
+  add_direct_rule_once ipv4 filter OUTPUT 100 -j DROP
+  add_direct_rule_once ipv6 filter OUTPUT 100 -j DROP
+
+  firewall-cmd --set-default-zone=drop >/dev/null 2>&1 || {
+    echo "Failed to set firewalld default zone to drop" >&2
+    return 1
+  }
+  firewall-cmd --reload >/dev/null 2>&1 || {
+    echo "Failed to reload firewalld" >&2
+    return 1
+  }
+}
+
 baseline_setup() {
+  if [[ -f "$LIFECYCLE_STATE_FILE" ]]; then
+    echo "TensorCage is already installed."
+    echo "Use 'tensorcage enable' to restore protection or 'tensorcage status' to inspect state."
+    return 1
+  fi
   print_banner
   confirm_install
   detect_opensuse_leap
@@ -1245,68 +1242,7 @@ EOF
   systemctl enable --now sockd
   systemctl enable --now unbound
 
-  log "Configuring firewall rules"
-  local DANTE_UID
-  local UNBOUND_UID
-  local ntp_ip
-  local dns_ip
-  local port
-
-  DANTE_UID="$(id -u nobody)"
-  UNBOUND_UID="$(id -u unbound)"
-
-  # Flush existing TensorCage rules so re-installing doesn't fail
-  firewall-cmd --permanent --direct --remove-rules ipv4 filter OUTPUT || true
-  firewall-cmd --permanent --direct --remove-rules ipv6 filter OUTPUT || true
-
-  firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
-
-  add_direct_rule_once ipv4 filter INPUT 0 -p tcp --dport 22 -j ACCEPT
-  add_direct_rule_once ipv6 filter INPUT 0 -p tcp --dport 22 -j ACCEPT
-
-  add_direct_rule_once ipv4 filter INPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  add_direct_rule_once ipv6 filter INPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  add_direct_rule_once ipv4 filter OUTPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  add_direct_rule_once ipv6 filter OUTPUT 0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-  add_direct_rule_once ipv4 filter INPUT 0 -i lo -j ACCEPT
-  add_direct_rule_once ipv6 filter INPUT 0 -i lo -j ACCEPT
-  add_direct_rule_once ipv4 filter OUTPUT 0 -o lo -j ACCEPT
-  add_direct_rule_once ipv6 filter OUTPUT 0 -o lo -j ACCEPT
-
-  add_direct_rule_once ipv4 filter OUTPUT 0 -d "${LOCAL_PROXY_IP}" -p tcp --dport "${DANTE_PORT}" -j ACCEPT
-
-  add_direct_rule_once ipv4 filter OUTPUT 0 -d "${DNS_LOCAL_IP}" -p udp --dport "${UNBOUND_PORT}" -j ACCEPT
-  add_direct_rule_once ipv4 filter OUTPUT 0 -d "${DNS_LOCAL_IP}" -p tcp --dport "${UNBOUND_PORT}" -j ACCEPT
-
-  for dns_ip in "${UPSTREAM_DNS_SERVERS[@]}"; do
-    add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p udp -d "${dns_ip}" --dport 53 -j ACCEPT
-    add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${UNBOUND_UID}" -p tcp -d "${dns_ip}" --dport 53 -j ACCEPT
-  done
-
-  add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner root --sport 68 --dport 67 -j ACCEPT
-  add_direct_rule_once ipv4 filter INPUT 0 -p udp --sport 67 --dport 68 -j ACCEPT
-
-  for port in "${DANTE_EGRESS_PORTS[@]}"; do
-    add_direct_rule_once ipv4 filter OUTPUT 5 -m owner --uid-owner "${DANTE_UID}" -p tcp --dport "${port}" -j ACCEPT
-  done
-
-  for ntp_ip in "${NTP_IPS[@]}"; do
-    add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner root -d "${ntp_ip}" --dport 123 -j ACCEPT
-    if id chrony >/dev/null 2>&1; then
-      add_direct_rule_once ipv4 filter OUTPUT 0 -p udp -m owner --uid-owner chrony -d "${ntp_ip}" --dport 123 -j ACCEPT
-    fi
-  done
-# Log unauthorized outbound attempts right before they hit the DROP rule
-  add_direct_rule_once ipv4 filter OUTPUT 99 -j LOG --log-prefix "TC_DROP: "
-  add_direct_rule_once ipv6 filter OUTPUT 99 -j LOG --log-prefix "TC_DROP: "
-
-  add_direct_rule_once ipv4 filter OUTPUT 100 -j DROP
-  add_direct_rule_once ipv6 filter OUTPUT 100 -j DROP
-
-  firewall-cmd --set-default-zone=drop
-  firewall-cmd --reload
-
+  configure_firewall_containment
   configure_sockd_systemd_override
   configure_nft_containment_service
 
@@ -1335,6 +1271,7 @@ EOF
   install_btc_wrapper
 
   refresh_managed_integrity_manifest
+  set_lifecycle_state "ENABLED"
 
   log "Machine secured successfully."
   echo
@@ -1399,12 +1336,12 @@ sync_runtime_policy() {
 # Uninstall / maintenance disable mode
 ########################################
 
-uninstall_tensorcage() {
+disable_tensorcage() {
   local dry_run="${1:-0}"
 
   if [[ "$dry_run" == "1" ]]; then
     cat <<EOF
-TensorCage uninstall dry run
+TensorCage disable dry run
 ============================
 
 Would disable:
@@ -1412,11 +1349,11 @@ Would disable:
   sockd
   unbound
 
-Would remove TensorCage-managed containment state:
+Would deactivate TensorCage-managed containment state:
   /etc/systemd/system/tensorcage-nft.service
   /usr/local/sbin/tensorcage-nft-apply
   /etc/systemd/system/sockd.service.d
-  ${TENSORCAGE_STATE_DIR}
+  active TensorCage nftables/firewalld rules and boot hooks
   TensorCage firewalld OUTPUT rules
   nftables table inet tensorcage
 
@@ -1432,8 +1369,8 @@ EOF
     return 0
   fi
 
-  log "Creating rollback snapshot before uninstall"
-  create_rollback_snapshot "uninstall" >/dev/null || true
+  log "Creating rollback snapshot before disable"
+  create_rollback_snapshot "disable" >/dev/null || true
   log "Disabling TensorCage controls for maintenance"
 
   log "Backing up active TensorCage-related configs"
@@ -1458,7 +1395,6 @@ EOF
   rm -f /etc/systemd/system/tensorcage-nft.service
   rm -f /usr/local/sbin/tensorcage-nft-apply
   rm -rf /etc/systemd/system/sockd.service.d
-  rm -rf "$TENSORCAGE_STATE_DIR"
   systemctl daemon-reload
   nft delete table inet tensorcage 2>/dev/null || true
 
@@ -1485,13 +1421,164 @@ EOF
   firewall-cmd --set-default-zone=public 2>/dev/null || true
   firewall-cmd --reload 2>/dev/null || true
 
+  set_lifecycle_state "DISABLED"
+
   log "TensorCage disabled for maintenance."
   echo
   echo "TensorCage controls are disabled for maintenance."
   echo "Packages, logs, keys, and config backups were preserved."
   echo
   echo "To re-enable protection later, run:"
-  echo "  sudo ${CLI_NAME} install"
+  echo "  sudo /usr/local/bin/tensorcage enable"
+}
+
+
+enable_tensorcage() {
+  require_baseline_install
+  log "Creating rollback snapshot before enable"
+  create_rollback_snapshot "enable" >/dev/null
+
+  systemctl enable --now firewalld
+  render_unbound_conf
+  render_unbound_allowlist 0 0
+  render_dante_conf 0 0
+  render_dante_client_conf
+  configure_sockd_systemd_override
+  systemctl daemon-reload
+  systemctl enable --now sockd unbound
+
+  configure_firewall_containment
+  configure_nft_containment_service
+  configure_chrony
+
+  local CFG=/etc/sysconfig/network/config
+  set_kv "NETCONFIG_DNS_POLICY" "STATIC" "$CFG"
+  set_kv "NETCONFIG_DNS_STATIC_SERVERS" "${DNS_LOCAL_IP}" "$CFG"
+  netconfig update -m dns
+
+  install_btc_wrapper
+  refresh_managed_integrity_manifest
+  run_doctor
+  set_lifecycle_state "ENABLED"
+  log "TensorCage enabled successfully"
+}
+
+status_tensorcage() {
+  local installed="NO"
+  local enabled="NO"
+  local healthy="NOT APPLICABLE"
+  local integrity="NOT APPLICABLE"
+  local recommendation=""
+  local local_health_ok="1"
+
+  if [[ -x /usr/local/bin/tensorcage && -x "$PYTHON_BIN" ]]; then
+    installed="YES"
+  fi
+
+  if systemctl is-active --quiet tensorcage-nft.service 2>/dev/null \
+    && systemctl is-active --quiet sockd 2>/dev/null \
+    && systemctl is-active --quiet unbound 2>/dev/null \
+    && firewall-cmd --direct --get-all-rules 2>/dev/null | grep -q 'ipv4 filter OUTPUT 100 -j DROP' \
+    && firewall-cmd --direct --get-all-rules 2>/dev/null | grep -q 'ipv6 filter OUTPUT 100 -j DROP' \
+    && nft list table inet tensorcage >/dev/null 2>&1; then
+    enabled="YES"
+  fi
+
+  if [[ "$installed" == "YES" ]]; then
+    if verify_managed_integrity_manifest >/dev/null 2>&1; then
+      integrity="PASS"
+    else
+      integrity="FAIL"
+      local_health_ok="0"
+    fi
+  fi
+
+  if [[ "$installed" == "YES" && "$enabled" == "YES" ]]; then
+    systemctl is-active --quiet firewalld 2>/dev/null || local_health_ok="0"
+    systemctl is-active --quiet chronyd 2>/dev/null || local_health_ok="0"
+    ss -lnt 2>/dev/null | grep -qE '127[.]0[.]0[.]1:1080[[:space:]]' || local_health_ok="0"
+    ss -lntu 2>/dev/null | grep -qE '127[.]0[.]0[.]1:53[[:space:]]' || local_health_ok="0"
+    LC_ALL=C chronyc tracking 2>/dev/null | grep -q '^Leap status[[:space:]]*:[[:space:]]*Normal' || local_health_ok="0"
+
+    if [[ "$local_health_ok" == "1" ]]; then
+      healthy="YES"
+    else
+      healthy="NO"
+      recommendation="sudo /usr/local/bin/tensorcage doctor"
+    fi
+  elif [[ "$installed" == "YES" ]]; then
+    recommendation="sudo /usr/local/bin/tensorcage enable"
+  else
+    recommendation="sudo ./tensorcage install"
+  fi
+
+  cat <<EOF
+TensorCage status
+=================
+Installed: ${installed}
+Enabled:   ${enabled}
+Healthy:   ${healthy}
+Integrity: ${integrity}
+EOF
+  [[ -z "$recommendation" ]] || printf 'Recommendation: %s\n' "$recommendation"
+  [[ "$installed" == "YES" ]] || return 1
+  return 0
+}
+
+verify_lock_command() {
+  validate_bittensor_lock "$LOCK_FILE" "$LOCK_HASH" "$BITTENSOR_VERSION"
+  printf 'Lock manifest verified successfully: %s\n' "$LOCK_FILE"
+}
+
+uninstall_tensorcage() {
+  local dry_run="${1:-0}"
+  local target_user=""
+  local target_home=""
+
+  target_user="$(get_target_user)"
+  target_home="$(get_target_home "$target_user")"
+
+  if [[ "$dry_run" == "1" ]]; then
+    cat <<EOF
+TensorCage uninstall dry run
+============================
+
+Would first disable active containment.
+Would remove:
+  /usr/local/bin/tensorcage
+  /usr/local/bin/btc
+  /opt/tensorcage
+  ${TENSORCAGE_STATE_DIR}
+  /usr/local/sbin/tensorcage-nft-apply
+  /etc/systemd/system/tensorcage-nft.service
+  TensorCage systemd overrides and active nft/firewalld state
+
+Would preserve:
+  ${target_home}/.bittensor wallets and keys
+  system journals and package-manager data
+  timestamped configuration backups
+  installed OS packages (Dante, Unbound, Chrony)
+  inactive configuration files for forensic review/reuse
+
+No changes were made.
+EOF
+    return 0
+  fi
+
+  disable_tensorcage 0
+
+  log "Removing TensorCage application and runtime state"
+  rm -f /usr/local/bin/btc
+  rm -f /usr/local/sbin/tensorcage-nft-apply
+  rm -f /etc/systemd/system/tensorcage-nft.service
+  rm -rf /etc/systemd/system/sockd.service.d
+  rm -rf /opt/tensorcage
+  rm -rf "$TENSORCAGE_STATE_DIR"
+  systemctl daemon-reload
+
+  log "TensorCage uninstalled; wallets and keys were preserved"
+  printf 'Preserved wallet path: %s/.bittensor\n' "$target_home"
+  rm -f /usr/local/bin/tensorcage
 }
 
 ########################################
@@ -1925,6 +2012,7 @@ TENSORCAGE_VERIFY_WHEELS_PY
 ########################################
 
 update_bittensor() {
+  require_enabled_state
   local bittensor_version="$1"
   local supplied_lock_file="$2"
   local lock_hash_expected="$3"
@@ -2285,6 +2373,19 @@ run_doctor() {
   local output=""
   local target_user=""
   local target_home=""
+
+  if ! systemctl is-active --quiet tensorcage-nft.service 2>/dev/null \
+    || ! systemctl is-active --quiet sockd 2>/dev/null \
+    || ! systemctl is-active --quiet unbound 2>/dev/null; then
+    echo
+    echo "${APP_NAME} Doctor ${APP_VERSION}"
+    echo "================================================="
+    echo "Installed: YES"
+    echo "Enabled:   NO"
+    echo "Health:    NOT APPLICABLE"
+    echo "Recommendation: sudo /usr/local/bin/tensorcage enable"
+    return 2
+  fi
 
   doctor_pass() {
     printf 'PASS  %s\n' "$1"
@@ -2777,54 +2878,22 @@ time_sync_command() {
 ########################################
 
 case "$COMMAND" in
-  install)
-    baseline_setup
-    ;;
-  time-sync)
-    time_sync_command
-    ;;
-  policy-sync)
-    sync_runtime_policy
-    ;;
-  os-update)
-    os_update
-    ;;
-  os-upgrade)
-    os_upgrade
-    ;;
-  uninstall)
-    uninstall_tensorcage "$UNINSTALL_DRY_RUN"
-    ;;
-  diff)
-    show_managed_diff
-    ;;
-  test)
-    run_focused_test "$TEST_TARGET"
-    ;;
-  selftest)
-    run_doctor
-    ;;
-  info)
-    show_info
-    ;;
-  doctor)
-    run_doctor
-    ;;
-  lock-create)
-    create_bittensor_lock \
-      "$BITTENSOR_VERSION" \
-      "$LOCK_OUTPUT"
-    ;;
-  update)
-    update_bittensor \
-      "$BITTENSOR_VERSION" \
-      "$LOCK_FILE" \
-      "$LOCK_HASH"
-    ;;
-  *)
-    usage
-    exit 1
-    ;;
+  install) baseline_setup ;;
+  enable) enable_tensorcage ;;
+  disable) disable_tensorcage "$DISABLE_DRY_RUN" ;;
+  status) status_tensorcage ;;
+  lock-create) create_bittensor_lock "$BITTENSOR_VERSION" "$LOCK_OUTPUT" ;;
+  lock-verify) verify_lock_command ;;
+  update) update_bittensor "$BITTENSOR_VERSION" "$LOCK_FILE" "$LOCK_HASH" ;;
+  doctor) run_doctor ;;
+  info) show_info ;;
+  uninstall) uninstall_tensorcage "$UNINSTALL_DRY_RUN" ;;
+  _policy-sync) sync_runtime_policy ;;
+  _time-sync) time_sync_command ;;
+  _os-update) os_update ;;
+  _os-upgrade) os_upgrade ;;
+  _diff) show_managed_diff ;;
+  _selftest) run_doctor ;;
+  _test) run_focused_test "$TEST_TARGET" ;;
+  *) usage; exit 1 ;;
 esac
-
-
