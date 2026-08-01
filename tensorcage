@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="1.8.3"
+APP_VERSION="1.9.0"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -44,6 +44,9 @@ NTP_IPS=(
 )
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/tensorcage/venv/bin/python}"
+
+TENSORCAGE_STATE_DIR="/var/lib/tensorcage"
+INTEGRITY_MANIFEST="${TENSORCAGE_STATE_DIR}/managed-configs.sha256"
 
 ########################################
 # Domain allowlists
@@ -109,6 +112,7 @@ Usage:
   ${CLI_NAME} os-upgrade
   ${CLI_NAME} uninstall
   ${CLI_NAME} info
+  ${CLI_NAME} doctor
   ${CLI_NAME} help
   ${CLI_NAME} version
 
@@ -123,7 +127,8 @@ Commands:
   os-update Temporarily open openSUSE mirrors, run zypper refresh/update, and re-close
   os-upgrade Temporarily open openSUSE mirrors, run zypper refresh/dup, and re-close
   uninstall Disable TensorCage controls for maintenance; install can reapply cleanly
-  info      Show security, network policy, and Dante/Unbound activity summary
+  info      Show security, network policy, and runtime activity summary
+  doctor    Run deep, read-only validation of all managed security components
   help      Show this help message
   version   Show version information
 
@@ -139,6 +144,8 @@ Examples:
   sudo ${CLI_NAME} os-upgrade
 
   sudo ${CLI_NAME} uninstall
+
+  sudo ${CLI_NAME} doctor
 
   # Unrestricted trusted host:
   ${CLI_NAME} lock-create \
@@ -268,6 +275,14 @@ case "${COMMAND}" in
   info)
     if [[ $# -ne 0 ]]; then
       echo "info does not accept extra arguments"
+      echo
+      usage
+      exit 1
+    fi
+    ;;
+  doctor)
+    if [[ $# -ne 0 ]]; then
+      echo "doctor does not accept extra arguments"
       echo
       usage
       exit 1
@@ -1266,6 +1281,8 @@ EOF
 
   install_btc_wrapper
 
+  refresh_managed_integrity_manifest
+
   log "Machine secured successfully."
   echo
   echo "TensorCage install completed successfully."
@@ -1293,6 +1310,8 @@ sync_runtime_policy() {
     echo "tensorcage-nft.service is not active after policy synchronization."
     return 1
   }
+
+  refresh_managed_integrity_manifest
 
   log "Closed runtime policy synchronized successfully"
 }
@@ -1326,6 +1345,7 @@ uninstall_tensorcage() {
   rm -f /etc/systemd/system/tensorcage-nft.service
   rm -f /usr/local/sbin/tensorcage-nft-apply
   rm -rf /etc/systemd/system/sockd.service.d
+  rm -rf "$TENSORCAGE_STATE_DIR"
   systemctl daemon-reload
   nft delete table inet tensorcage 2>/dev/null || true
 
@@ -1926,6 +1946,8 @@ TENSORCAGE_VERIFY_PY
 
   trap - EXIT
   cleanup
+  refresh_managed_integrity_manifest
+
   log "Complete hash-locked unified Bittensor update completed"
 }
 
@@ -2019,6 +2041,250 @@ os_upgrade() {
 }
 
 ########################################
+# Managed configuration integrity
+########################################
+
+managed_integrity_paths() {
+  cat <<'EOF'
+/etc/unbound/unbound.conf
+/etc/unbound/allowlist/domains.conf
+/etc/sockd.conf
+/etc/socks.conf
+/etc/chrony.conf
+/usr/local/bin/btc
+/usr/local/bin/tensorcage
+/usr/local/sbin/tensorcage-nft-apply
+/etc/systemd/system/tensorcage-nft.service
+EOF
+}
+
+refresh_managed_integrity_manifest() {
+  local tmpfile=""
+  local path=""
+
+  install -d -o root -g root -m 0700 "$TENSORCAGE_STATE_DIR"
+  tmpfile="$(mktemp "${TENSORCAGE_STATE_DIR}/managed-configs.sha256.XXXXXX")"
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    if [[ ! -f "$path" || -L "$path" ]]; then
+      echo "Cannot record integrity for missing or unsafe managed file: $path"
+      rm -f "$tmpfile"
+      return 1
+    fi
+    sha256sum "$path" >> "$tmpfile"
+  done < <(managed_integrity_paths)
+
+  chown root:root "$tmpfile"
+  chmod 0600 "$tmpfile"
+  mv -f "$tmpfile" "$INTEGRITY_MANIFEST"
+}
+
+verify_managed_integrity_manifest() {
+  [[ -f "$INTEGRITY_MANIFEST" && ! -L "$INTEGRITY_MANIFEST" ]] || {
+    echo "Integrity manifest is missing or unsafe: $INTEGRITY_MANIFEST"
+    return 1
+  }
+
+  (cd / && sha256sum --check --strict "$INTEGRITY_MANIFEST")
+}
+
+########################################
+# Deep doctor mode
+########################################
+
+run_doctor() {
+  local pass_count=0
+  local warn_count=0
+  local fail_count=0
+  local path=""
+  local service=""
+  local output=""
+  local target_user=""
+  local target_home=""
+
+  doctor_pass() {
+    printf 'PASS  %s\n' "$1"
+    pass_count=$((pass_count + 1))
+  }
+
+  doctor_warn() {
+    printf 'WARN  %s\n' "$1"
+    warn_count=$((warn_count + 1))
+  }
+
+  doctor_fail() {
+    printf 'FAIL  %s\n' "$1"
+    fail_count=$((fail_count + 1))
+  }
+
+  echo
+  echo "${APP_NAME} Doctor ${APP_VERSION}"
+  echo "================================================="
+
+  echo
+  echo "[Managed files]"
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    if [[ -f "$path" && ! -L "$path" ]]; then
+      doctor_pass "regular managed file: $path"
+    else
+      doctor_fail "missing or unsafe managed file: $path"
+    fi
+  done < <(managed_integrity_paths)
+
+  echo
+  echo "[Configuration integrity]"
+  if output="$(verify_managed_integrity_manifest 2>&1)"; then
+    doctor_pass "managed configuration hashes match"
+  else
+    doctor_fail "managed configuration integrity mismatch"
+    printf '%s\n' "$output" | sed 's/^/      /'
+  fi
+
+  echo
+  echo "[Configuration parsers]"
+  if /usr/sbin/unbound-checkconf /etc/unbound/unbound.conf >/dev/null 2>&1; then
+    doctor_pass "Unbound configuration parses"
+  else
+    doctor_fail "Unbound configuration does not parse"
+  fi
+  if /usr/sbin/sockd -V -f /etc/sockd.conf >/dev/null 2>&1; then
+    doctor_pass "Dante server configuration parses"
+  else
+    doctor_fail "Dante server configuration does not parse"
+  fi
+  if /usr/sbin/chronyd -p -f /etc/chrony.conf >/dev/null 2>&1; then
+    doctor_pass "Chrony configuration parses"
+  else
+    doctor_fail "Chrony configuration does not parse"
+  fi
+  if grep -qE 'via:[[:space:]]*127[.]0[.]0[.]1[[:space:]]+port[[:space:]]*=[[:space:]]*1080' /etc/socks.conf; then
+    doctor_pass "Dante client routes through 127.0.0.1:1080"
+  else
+    doctor_fail "Dante client route is missing"
+  fi
+
+  echo
+  echo "[Services]"
+  for service in firewalld sockd unbound chronyd tensorcage-nft.service; do
+    if systemctl is-enabled --quiet "$service" 2>/dev/null; then
+      doctor_pass "$service enabled"
+    else
+      doctor_fail "$service not enabled"
+    fi
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+      doctor_pass "$service active"
+    else
+      doctor_fail "$service not active"
+    fi
+  done
+
+  echo
+  echo "[Local listeners]"
+  if ss -lnt 2>/dev/null | grep -qE '127[.]0[.]0[.]1:1080[[:space:]]'; then
+    doctor_pass "Dante listens on 127.0.0.1:1080"
+  else
+    doctor_fail "Dante listener missing on 127.0.0.1:1080"
+  fi
+  if ss -lntu 2>/dev/null | grep -qE '127[.]0[.]0[.]1:53[[:space:]]'; then
+    doctor_pass "Unbound listens on 127.0.0.1:53"
+  else
+    doctor_fail "Unbound listener missing on 127.0.0.1:53"
+  fi
+
+  echo
+  echo "[Firewall containment]"
+  if firewall-cmd --direct --get-all-rules 2>/dev/null | grep -q 'ipv4 filter OUTPUT 100 -j DROP'; then
+    doctor_pass "IPv4 terminal OUTPUT drop present"
+  else
+    doctor_fail "IPv4 terminal OUTPUT drop missing"
+  fi
+  if firewall-cmd --direct --get-all-rules 2>/dev/null | grep -q 'ipv6 filter OUTPUT 100 -j DROP'; then
+    doctor_pass "IPv6 terminal OUTPUT drop present"
+  else
+    doctor_fail "IPv6 terminal OUTPUT drop missing"
+  fi
+  if nft list table inet tensorcage >/dev/null 2>&1; then
+    doctor_pass "TensorCage nftables table loaded"
+  else
+    doctor_fail "TensorCage nftables table missing"
+  fi
+
+  echo
+  echo "[DNS policy]"
+  if output="$(dig @127.0.0.1 pypi.org +time=2 +tries=1 2>/dev/null)" && grep -q 'status: REFUSED' <<<"$output"; then
+    doctor_pass "PyPI DNS closed"
+  else
+    doctor_fail "PyPI DNS is not closed"
+  fi
+  if output="$(dig @127.0.0.1 github.com +time=2 +tries=1 2>/dev/null)" && grep -q 'status: REFUSED' <<<"$output"; then
+    doctor_pass "GitHub DNS blocked"
+  else
+    doctor_fail "GitHub DNS is not blocked"
+  fi
+  if output="$(dig @127.0.0.1 opentensor.ai +time=3 +tries=1 2>/dev/null)" && grep -q 'status: NOERROR' <<<"$output"; then
+    doctor_pass "Bittensor runtime DNS allowed"
+  else
+    doctor_fail "Bittensor runtime DNS unavailable"
+  fi
+
+  echo
+  echo "[Time synchronization]"
+  if LC_ALL=C chronyc tracking 2>/dev/null | grep -q '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
+    doctor_pass "Chrony synchronized"
+  else
+    doctor_fail "Chrony not synchronized"
+  fi
+  if LC_ALL=C chronyc -n sources 2>/dev/null | grep -q '^\^\*'; then
+    doctor_pass "Chrony selected a pinned source"
+  else
+    doctor_fail "Chrony has no selected source"
+  fi
+
+  echo
+  echo "[Bittensor runtime]"
+  if [[ -x "$PYTHON_BIN" ]]; then
+    doctor_pass "TensorCage Python present"
+  else
+    doctor_fail "TensorCage Python missing: $PYTHON_BIN"
+  fi
+  if [[ -x /opt/tensorcage/venv/bin/btcli ]]; then
+    doctor_pass "unified btcli executable present"
+    if /opt/tensorcage/venv/bin/btcli --version >/dev/null 2>&1; then
+      doctor_pass "unified btcli starts"
+    else
+      doctor_fail "unified btcli failed to start"
+    fi
+  else
+    doctor_fail "unified btcli executable missing"
+  fi
+  if [[ -x /usr/local/bin/btc ]]; then
+    doctor_pass "btc wrapper present"
+  else
+    doctor_fail "btc wrapper missing"
+  fi
+
+  target_user="$(get_target_user)"
+  target_home="$(get_target_home "$target_user")"
+  if [[ -d "${target_home}/.bittensor/wallets" ]]; then
+    doctor_pass "wallet directory present for ${target_user}"
+  else
+    doctor_warn "wallet directory not found for ${target_user}"
+  fi
+
+  echo
+  echo "[Summary]"
+  printf 'PASS=%d  WARN=%d  FAIL=%d\n' "$pass_count" "$warn_count" "$fail_count"
+  if [[ "$fail_count" -eq 0 ]]; then
+    echo "Overall: PASS"
+    return 0
+  fi
+  echo "Overall: FAIL"
+  return 1
+}
+
+########################################
 # Info / diagnostics mode
 ########################################
 show_info() {
@@ -2089,11 +2355,25 @@ show_info() {
   echo
 
   echo "[Direct Firewall Drops (excluding DNS, last hour)]"
-  if ! journalctl -k --since "1 hour ago" 2>/dev/null | \
-    grep "TC_DROP:" | \
-    grep -Ev 'DPT=53([[:space:]]|$)' | \
-    awk -F 'TC_DROP:' '{print $2}' | \
-    tail -n 15; then
+  aggregated_drops="$({
+    journalctl -k --since "1 hour ago" --no-pager 2>/dev/null |
+      grep "TC_DROP:" |
+      grep -Ev 'DPT=53([[:space:]]|$)' |
+      awk '
+        {
+          destination="unknown"; protocol="unknown"; port="unknown"
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^DST=/) { destination=substr($i, 5) }
+            if ($i ~ /^PROTO=/) { protocol=substr($i, 7) }
+            if ($i ~ /^DPT=/) { port=substr($i, 5) }
+          }
+          print protocol, destination, port
+        }
+      ' | sort | uniq -c | sort -nr | head -n 15
+  } || true)"
+  if [[ -n "$aggregated_drops" ]]; then
+    printf '%s\n' "$aggregated_drops"
+  else
     echo "No non-DNS direct firewall drops logged."
   fi
   echo
@@ -2212,6 +2492,16 @@ show_info() {
   echo
 
   echo
+  echo "[Managed configuration integrity]"
+  if verify_managed_integrity_manifest >/dev/null 2>&1; then
+    echo "PASS: managed files match ${INTEGRITY_MANIFEST}"
+    echo "Manifest SHA256: $(sha256_file "$INTEGRITY_MANIFEST")"
+  else
+    echo "WARNING: managed files differ or the integrity manifest is missing."
+    verify_managed_integrity_manifest 2>&1 || true
+  fi
+
+  echo
   echo "[Installed Bittensor packages]"
   target_user="$(get_target_user)"
   target_home="$(get_target_home "$target_user")"
@@ -2237,6 +2527,11 @@ TENSORCAGE_PY
   echo "Info check completed."
 }
 
+time_sync_command() {
+  configure_chrony
+  refresh_managed_integrity_manifest
+}
+
 ########################################
 # Main
 ########################################
@@ -2246,7 +2541,7 @@ case "$COMMAND" in
     baseline_setup
     ;;
   time-sync)
-    configure_chrony
+    time_sync_command
     ;;
   policy-sync)
     sync_runtime_policy
@@ -2262,6 +2557,9 @@ case "$COMMAND" in
     ;;
   info)
     show_info
+    ;;
+  doctor)
+    run_doctor
     ;;
   lock-create)
     create_bittensor_lock \
