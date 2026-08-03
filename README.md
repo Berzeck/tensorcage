@@ -35,7 +35,7 @@ sudo ./tensorcage update \
   wallet=4.0.0 \
   btcli_hash=<sha256> \
   wallet_hash=<sha256>
-  
+
 
 🧪 Testing Recommendation
 
@@ -56,3 +56,51 @@ Leap 16.x (experimental)
 Not suitable for:
 multi-user systems
 desktop environments
+
+<!-- BEGIN TENSORCAGE INSTALLATION LAYOUT -->
+
+## 📁 Installed filesystem layout
+
+TensorCage separates installed programs, integrity-managed configuration,
+persistent security state, transient runtime files, and preserved wallet
+data.
+
+| Path | Purpose |
+|---|---|
+| `/usr/local/bin/tensorcage` | Main TensorCage lifecycle and diagnostic command |
+| `/usr/local/bin/btc` | Bittensor CLI wrapper using native SOCKS transport |
+| `/usr/local/sbin/tensorcage-nft-apply` | Root-only nftables containment loader |
+| `/opt/tensorcage/venv/` | Root-managed Python and Bittensor runtime |
+| `/var/lib/tensorcage/` | Root-private lifecycle, integrity, and rollback state |
+| `/etc/unbound/unbound.conf` | Managed local DNS resolver configuration |
+| `/etc/unbound/allowlist/domains.conf` | Managed DNS policy |
+| `/etc/sockd.conf` | Managed Dante SOCKS server configuration |
+| `/etc/socks.conf` | Managed native SOCKS client routing |
+| `/etc/chrony.conf` | Managed pinned time-source configuration |
+| `/etc/systemd/system/tensorcage-nft.service` | Persistent nftables containment unit |
+
+TensorCage verifies nine regular, non-symbolic-link managed files through
+`/var/lib/tensorcage/managed-configs.v2.tsv`. Runtime material under
+`/run` is transient. User wallets under `~/.bittensor/wallets` are
+preserved and are not owned, inventoried, or removed by TensorCage.
+
+The complete path inventory—including ownership, modes, persistence,
+rollback contents, systemd integration, external configuration effects,
+disable behavior, and uninstall behavior—is documented in
+[`docs/installation-layout.md`](docs/installation-layout.md).
+
+Useful integrity commands:
+
+~~~bash
+sudo /usr/local/bin/tensorcage status
+sudo /usr/local/bin/tensorcage doctor
+sudo /usr/local/bin/tensorcage _diff
+~~~
+
+Repository documentation regression check:
+
+~~~bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v
+~~~
+
+<!-- END TENSORCAGE INSTALLATION LAYOUT -->

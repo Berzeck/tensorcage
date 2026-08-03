@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 APP_NAME="TensorCage"
-APP_VERSION="2.0.2"
+APP_VERSION="2.0.3"
 CLI_NAME="tensorcage"
 
 set -euo pipefail
@@ -342,6 +342,308 @@ require_command() {
     echo "Required command not found: $cmd"
     exit 1
   }
+}
+
+verify_package_installed() {
+  local package_name="$1"
+
+  if ! rpm -q "$package_name" >/dev/null 2>&1; then
+    printf 'Required system package is not installed: %s\n' \
+      "$package_name" >&2
+    return 1
+  fi
+}
+
+verify_owned_executable() {
+  local executable_path="$1"
+  local expected_package="$2"
+  local executable_owner=''
+  local owning_package=''
+  local resolved_path=''
+  local resolved_owner=''
+  local resolved_package=''
+
+  if [[ ! -e "$executable_path" && ! -L "$executable_path" ]]; then
+    printf 'Required executable path is missing: %s\n' \
+      "$executable_path" >&2
+    return 1
+  fi
+
+  if [[ ! -x "$executable_path" ]]; then
+    printf 'Required executable is not executable: %s\n' \
+      "$executable_path" >&2
+    return 1
+  fi
+
+  executable_owner="$(
+    stat -c '%U:%G' -- "$executable_path"
+  )" || return 1
+
+  if [[ "$executable_owner" != 'root:root' ]]; then
+    printf 'Executable path is not owned by root:root: %s\n' \
+      "$executable_path" >&2
+    return 1
+  fi
+
+  owning_package="$(
+    rpm -qf \
+      --qf '%{NAME}\n' \
+      "$executable_path" 2>/dev/null
+  )" || {
+    printf 'Executable is not RPM-owned: %s\n' \
+      "$executable_path" >&2
+    return 1
+  }
+
+  if [[ "$owning_package" != "$expected_package" ]]; then
+    printf 'Unexpected package owner for %s: %s\n' \
+      "$executable_path" \
+      "$owning_package" >&2
+    return 1
+  fi
+
+  resolved_path="$(
+    readlink -f -- "$executable_path"
+  )" || {
+    printf 'Could not resolve executable path: %s\n' \
+      "$executable_path" >&2
+    return 1
+  }
+
+  if [[ -z "$resolved_path" ]]; then
+    printf 'Executable resolved to an empty path: %s\n' \
+      "$executable_path" >&2
+    return 1
+  fi
+
+  if [[ ! -f "$resolved_path" ||
+        -L "$resolved_path" ||
+        ! -x "$resolved_path" ]]
+  then
+    printf 'Executable resolves to an unsafe target: %s\n' \
+      "$resolved_path" >&2
+    return 1
+  fi
+
+  resolved_owner="$(
+    stat -c '%U:%G' -- "$resolved_path"
+  )" || return 1
+
+  if [[ "$resolved_owner" != 'root:root' ]]; then
+    printf 'Executable target is not owned by root:root: %s\n' \
+      "$resolved_path" >&2
+    return 1
+  fi
+
+  resolved_package="$(
+    rpm -qf \
+      --qf '%{NAME}\n' \
+      "$resolved_path" 2>/dev/null
+  )" || {
+    printf 'Executable target is not RPM-owned: %s\n' \
+      "$resolved_path" >&2
+    return 1
+  }
+
+  if [[ -z "$resolved_package" ]]; then
+    printf 'Executable target has an empty RPM owner: %s\n' \
+      "$resolved_path" >&2
+    return 1
+  fi
+}
+
+verify_xtables_plugin() {
+  local plugin_name="$1"
+  local plugin_path=''
+  local plugin_owner=''
+  local owning_package=''
+
+  plugin_path="$(
+    rpm -ql xtables-plugins 2>/dev/null |
+      grep -F "/${plugin_name}" |
+      head -n 1
+  )"
+
+  if [[ -z "$plugin_path" ]]; then
+    printf 'Required xtables plugin was not listed: %s\n' \
+      "$plugin_name" >&2
+    return 1
+  fi
+
+  if [[ ! -f "$plugin_path" ||
+        -L "$plugin_path" ||
+        ! -x "$plugin_path" ]]
+  then
+    printf 'Required xtables plugin is missing or unsafe: %s\n' \
+      "$plugin_path" >&2
+    return 1
+  fi
+
+  plugin_owner="$(
+    stat -c '%U:%G' -- "$plugin_path"
+  )" || return 1
+
+  if [[ "$plugin_owner" != 'root:root' ]]; then
+    printf 'xtables plugin is not owned by root:root: %s\n' \
+      "$plugin_path" >&2
+    return 1
+  fi
+
+  owning_package="$(
+    rpm -qf \
+      --qf '%{NAME}\n' \
+      "$plugin_path" 2>/dev/null
+  )" || {
+    printf 'xtables plugin is not RPM-owned: %s\n' \
+      "$plugin_path" >&2
+    return 1
+  }
+
+  if [[ "$owning_package" != 'xtables-plugins' ]]; then
+    printf 'Unexpected package owner for %s: %s\n' \
+      "$plugin_path" \
+      "$owning_package" >&2
+    return 1
+  fi
+}
+
+verify_firewall_compatibility_dependencies() {
+  local package_name=''
+  local executable_path=''
+  local plugin_name=''
+  local version_output=''
+  local required_packages=(
+    firewalld
+    iptables
+    nftables
+    xtables-plugins
+  )
+  local required_executables=(
+    /usr/sbin/iptables
+    /usr/sbin/ip6tables
+    /usr/sbin/iptables-restore
+    /usr/sbin/ip6tables-restore
+  )
+  local required_plugins=(
+    libxt_LOG.so
+    libxt_conntrack.so
+    libxt_owner.so
+  )
+
+  for package_name in "${required_packages[@]}"; do
+    verify_package_installed "$package_name" || return 1
+  done
+
+  for executable_path in "${required_executables[@]}"; do
+    verify_owned_executable \
+      "$executable_path" \
+      iptables || return 1
+
+    version_output="$(
+      "$executable_path" --version 2>&1
+    )" || {
+      printf 'Could not execute %s --version\n' \
+        "$executable_path" >&2
+      return 1
+    }
+
+    if ! grep -Fq '(nf_tables)' <<<"$version_output"; then
+      printf 'Required nf_tables backend is not selected: %s\n' \
+        "$version_output" >&2
+      return 1
+    fi
+  done
+
+  for plugin_name in "${required_plugins[@]}"; do
+    verify_xtables_plugin "$plugin_name" || return 1
+  done
+}
+
+verify_firewalld_direct_backends() {
+  local family=''
+  local output=''
+
+  if ! systemctl is-active --quiet firewalld; then
+    printf '%s\n' 'firewalld is not active.' >&2
+    return 1
+  fi
+
+  for family in ipv4 ipv6; do
+    output="$(
+      firewall-cmd \
+        --direct \
+        --get-chains \
+        "$family" \
+        filter 2>&1
+    )" || {
+      printf 'firewalld direct backend unavailable for %s: %s\n' \
+        "$family" \
+        "$output" >&2
+      return 1
+    }
+  done
+}
+
+firewall_terminal_drop_present() {
+  local scope="$1"
+  local family="$2"
+  local output=''
+  local command_args=(
+    --direct
+    --get-all-rules
+  )
+
+  if [[ "$scope" == 'permanent' ]]; then
+    command_args=(
+      --permanent
+      --direct
+      --get-all-rules
+    )
+  elif [[ "$scope" != 'runtime' ]]; then
+    printf 'Unsupported firewalld scope: %s\n' \
+      "$scope" >&2
+    return 1
+  fi
+
+  output="$(
+    firewall-cmd "${command_args[@]}" 2>&1
+  )" || {
+    printf 'Could not read %s firewalld direct rules: %s\n' \
+      "$scope" \
+      "$output" >&2
+    return 1
+  }
+
+  awk -v family="$family" '
+    $1 == family &&
+    $2 == "filter" &&
+    $3 == "OUTPUT" &&
+    $4 == "100" &&
+    $5 == "-j" &&
+    $6 == "DROP" {
+      found = 1
+    }
+
+    END {
+      exit(found ? 0 : 1)
+    }
+  ' <<<"$output"
+}
+
+verify_firewall_terminal_drops() {
+  local scope=''
+  local family=''
+
+  for scope in permanent runtime; do
+    for family in ipv4 ipv6; do
+      if ! firewall_terminal_drop_present "$scope" "$family"; then
+        printf 'Missing %s %s terminal OUTPUT drop.\n' \
+          "$scope" \
+          "$family" >&2
+        return 1
+      fi
+    done
+  done
 }
 
 get_target_user() {
@@ -1143,6 +1445,9 @@ configure_firewall_containment() {
   local dns_ip
   local port
 
+  verify_firewall_compatibility_dependencies || return 1
+  verify_firewalld_direct_backends || return 1
+
   DANTE_UID="$(id -u nobody)"
   UNBOUND_UID="$(id -u unbound)"
 
@@ -1203,6 +1508,9 @@ configure_firewall_containment() {
     echo "Failed to reload firewalld" >&2
     return 1
   }
+
+  verify_firewalld_direct_backends || return 1
+  verify_firewall_terminal_drops || return 1
 }
 
 baseline_setup() {
@@ -1236,7 +1544,13 @@ baseline_setup() {
   zypper refresh
 
   log "Installing required packages"
-  zypper install -y dante-server unbound dante chrony
+  zypper install -y \
+    dante-server \
+    unbound \
+    dante \
+    chrony \
+    iptables \
+    xtables-plugins
 
   require_command sockd
   require_command unbound-checkconf
@@ -1244,6 +1558,15 @@ baseline_setup() {
   require_command socksify
   require_command chronyd
   require_command chronyc
+  require_command rpm
+  require_command readlink
+  require_command stat
+
+  log "Restarting firewalld after compatibility-package installation"
+  systemctl restart firewalld
+
+  verify_firewall_compatibility_dependencies
+  verify_firewalld_direct_backends
 
   log "Preparing Unbound runtime directory"
   mkdir -p /run/unbound
@@ -1317,10 +1640,68 @@ create_rollback_snapshot() {
   local stamp=""
   local destination=""
   local path=""
+  local directory_metadata=""
+
+  if [[ -L "$TENSORCAGE_STATE_DIR" ||
+        ( -e "$TENSORCAGE_STATE_DIR" &&
+          ! -d "$TENSORCAGE_STATE_DIR" ) ]]
+  then
+    printf 'Unsafe TensorCage state directory: %s\n' \
+      "$TENSORCAGE_STATE_DIR" >&2
+    return 1
+  fi
+
+  install -d \
+    -o root \
+    -g root \
+    -m 0700 \
+    "$TENSORCAGE_STATE_DIR" || return 1
+
+  if [[ -L "$ROLLBACK_ROOT" ||
+        ( -e "$ROLLBACK_ROOT" &&
+          ! -d "$ROLLBACK_ROOT" ) ]]
+  then
+    printf 'Unsafe TensorCage rollback root: %s\n' \
+      "$ROLLBACK_ROOT" >&2
+    return 1
+  fi
+
+  install -d \
+    -o root \
+    -g root \
+    -m 0700 \
+    "$ROLLBACK_ROOT" || return 1
+
+  for path in \
+    "$TENSORCAGE_STATE_DIR" \
+    "$ROLLBACK_ROOT"
+  do
+    directory_metadata="$(
+      stat -c '%U:%G:%a' -- "$path"
+    )" || return 1
+
+    if [[ "$directory_metadata" != 'root:root:700' ]]; then
+      printf 'Unsafe TensorCage state-directory metadata: %s: %s\n' \
+        "$path" \
+        "$directory_metadata" >&2
+      return 1
+    fi
+  done
 
   stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
   destination="${ROLLBACK_ROOT}/${stamp}-${reason}"
-  install -d -o root -g root -m 0700 "$destination/files"
+
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    printf 'Rollback snapshot destination already exists: %s\n' \
+      "$destination" >&2
+    return 1
+  fi
+
+  install -d \
+    -o root \
+    -g root \
+    -m 0700 \
+    "$destination/files" || return 1
 
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
@@ -1511,8 +1892,9 @@ status_tensorcage() {
   if systemctl is-active --quiet tensorcage-nft.service 2>/dev/null \
     && systemctl is-active --quiet sockd 2>/dev/null \
     && systemctl is-active --quiet unbound 2>/dev/null \
-    && firewall-cmd --direct --get-all-rules 2>/dev/null | grep -q 'ipv4 filter OUTPUT 100 -j DROP' \
-    && firewall-cmd --direct --get-all-rules 2>/dev/null | grep -q 'ipv6 filter OUTPUT 100 -j DROP' \
+    && verify_firewall_compatibility_dependencies >/dev/null 2>&1 \
+    && verify_firewalld_direct_backends >/dev/null 2>&1 \
+    && verify_firewall_terminal_drops >/dev/null 2>&1 \
     && nft list table inet tensorcage >/dev/null 2>&1; then
     enabled="YES"
   fi
@@ -2555,6 +2937,19 @@ run_doctor() {
   fi
 
   echo
+  echo "[System firewall dependencies]"
+  if verify_firewall_compatibility_dependencies >/dev/null 2>&1; then
+    doctor_pass "iptables/xtables nft compatibility dependencies valid"
+  else
+    doctor_fail "iptables/xtables nft compatibility dependencies invalid"
+  fi
+  if verify_firewalld_direct_backends >/dev/null 2>&1; then
+    doctor_pass "firewalld IPv4 and IPv6 direct backends available"
+  else
+    doctor_fail "firewalld IPv4 or IPv6 direct backend unavailable"
+  fi
+
+  echo
   echo "[Services]"
   for service in firewalld sockd unbound chronyd tensorcage-nft.service; do
     if systemctl is-enabled --quiet "$service" 2>/dev/null; then
@@ -2711,13 +3106,15 @@ run_focused_test() {
       echo "PASS: native asynchronous SOCKS path through Dante"
       ;;
     firewall)
-      firewall-cmd --direct --get-all-rules | grep -q 'ipv4 filter OUTPUT 100 -j DROP' \
-        || { echo "FAIL: IPv4 terminal drop missing"; return 1; }
-      firewall-cmd --direct --get-all-rules | grep -q 'ipv6 filter OUTPUT 100 -j DROP' \
-        || { echo "FAIL: IPv6 terminal drop missing"; return 1; }
+      verify_firewall_compatibility_dependencies \
+        || { echo "FAIL: firewall compatibility dependencies invalid"; return 1; }
+      verify_firewalld_direct_backends \
+        || { echo "FAIL: firewalld direct backend unavailable"; return 1; }
+      verify_firewall_terminal_drops \
+        || { echo "FAIL: permanent or runtime terminal drop missing"; return 1; }
       nft list table inet tensorcage >/dev/null 2>&1 \
         || { echo "FAIL: TensorCage nftables table missing"; return 1; }
-      echo "PASS: firewall containment present"
+      echo "PASS: firewall containment and compatibility dependencies present"
       ;;
     chrony)
       LC_ALL=C chronyc tracking | grep -q '^Leap status[[:space:]]*: Normal' \
