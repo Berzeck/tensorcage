@@ -10,8 +10,8 @@ set -euo pipefail
 # Tested baseline
 ########################################
 
-SUPPORTED_OPENSUSE_RELS=("15.6" "16.0")
-TESTED_OPENSUSE_REL="15.6 / 16.0"
+SUPPORTED_OPENSUSE_RELS=("16.0")
+TESTED_OPENSUSE_REL="16.0"
 OPENSUSE_REL=""
 
 ########################################
@@ -720,11 +720,11 @@ detect_opensuse_leap() {
   OPENSUSE_REL="$os_version"
 
   case "$OPENSUSE_REL" in
-    15.6|16.0)
+    16.0)
       ;;
     *)
       echo "Unsupported openSUSE Leap version: ${OPENSUSE_REL}"
-      echo "TensorCage currently supports openSUSE Leap 15.6 and 16.0."
+      echo "TensorCage currently supports openSUSE Leap 16.0 only."
       exit 1
       ;;
   esac
@@ -784,14 +784,6 @@ configure_repos() {
   log "Ensuring repo definitions for openSUSE Leap ${OPENSUSE_REL}"
 
   case "$OPENSUSE_REL" in
-    15.6)
-      ensure_repo repo-oss "https://download.opensuse.org/distribution/leap/${OPENSUSE_REL}/repo/oss/"
-      ensure_repo repo-non-oss "https://download.opensuse.org/distribution/leap/${OPENSUSE_REL}/repo/non-oss/"
-      ensure_repo repo-update "https://download.opensuse.org/update/leap/${OPENSUSE_REL}/oss/"
-      ensure_repo repo-update-non-oss "https://download.opensuse.org/update/leap/${OPENSUSE_REL}/non-oss/"
-      ensure_repo repo-backports-update "https://download.opensuse.org/update/leap/${OPENSUSE_REL}/backports/"
-      ensure_repo repo-sle-update "https://download.opensuse.org/update/leap/${OPENSUSE_REL}/sle/"
-      ;;
     16.0)
       ensure_repo repo-oss "https://download.opensuse.org/distribution/leap/${OPENSUSE_REL}/repo/oss/"
       ensure_repo repo-non-oss "https://download.opensuse.org/distribution/leap/${OPENSUSE_REL}/repo/non-oss/"
